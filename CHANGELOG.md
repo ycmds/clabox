@@ -1,3 +1,10 @@
+# [0.1.0](https://github.com/ycmds/clabox/compare/v0.0.2...v0.1.0) (2026-06-23)
+
+
+### Features
+
+* improve init for creating ghostty apps ([5bb7236](https://github.com/ycmds/clabox/commit/5bb7236fe88dbff2537990f4fadb2ae6ad45ba30))
+
 ## [0.0.2](https://github.com/ycmds/clabox/compare/v0.0.1...v0.0.2) (2026-06-23)
 
 
