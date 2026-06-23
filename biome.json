@@ -7,11 +7,21 @@
       "suspicious": { "noExplicitAny": "off" },
       "style": { "noNonNullAssertion": "off" },
       "correctness": {
-        "useImportExtensions": { "level": "error", "options": { "forceJsExtensions": true } }
+        "useImportExtensions": {
+          "level": "error",
+          "options": { "forceJsExtensions": true }
+        }
       }
     }
   },
-  "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
-  "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "always" } },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "formatter": { "quoteStyle": "single", "semicolons": "always" }
+  },
   "files": { "includes": ["src/**/*.ts", "tests/**/*.ts"] }
 }

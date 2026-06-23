@@ -43,6 +43,9 @@ clabox run --dangerously-skip-permissions
 # A different Claude profile
 CLAUDE_CONFIG_DIR=~/.claude_work clabox run --dangerously-skip-permissions
 
+# A named box from ~/.config/clabox/configs/<name>.config.mjs
+clabox -b ax-root --dangerously-skip-permissions
+
 # Debugging
 clabox generate            # build the profile, print the .sb path
 clabox profile             # just the path (no build)
@@ -86,6 +89,31 @@ export default {
 You may also export a function `(defaults) => config` for full control. `~` is
 expanded to `$HOME`.
 
+### Named boxes (`-b` / `--box`)
+
+Keep a directory of named configs and switch between them by name from anywhere:
+
+```bash
+# ~/.config/clabox/configs/ax-root.config.mjs
+clabox -b ax-root --dangerously-skip-permissions
+```
+
+`-b <name>` resolves `~/.config/clabox/configs/<name>.config.mjs` (falling back
+to a bare `<name>.mjs`) and loads it like `--config` — so it wins over `--config`
+/ `CLABOX_CONFIG`. Override the dir with `CLABOX_CONFIGS_DIR`. Files named
+`_*.mjs` are treated as shared partials (e.g. `_presets.mjs`), not boxes.
+
+A box can pin its own `cwd` so it always targets one project, no matter where you
+run `clabox` from:
+
+```js
+// ~/.config/clabox/configs/ax-root.config.mjs
+export default {
+  cwd: '~/projects/my-app', // claude runs here; this dir is the RW project dir
+  configDir: '~/.claude_axiomus',
+};
+```
+
 ### Environment variables
 
 | Variable | Purpose | Default |
@@ -95,6 +123,8 @@ expanded to `$HOME`.
 | `CLABOX_BOT_NAME` / `CLABOX_BOT_EMAIL` | git identity | `claudeBOT` / `bot@example.com` |
 | `CLABOX_BOT_SSH_DIR` | bot key dir (`id_ed25519`, `config`) | `~/.ssh/claudebot` |
 | `CLABOX_CONFIG` | path to the JS config file (the `--config` flag overrides it) | — |
+| `CLABOX_CONFIGS_DIR` | global dir of named boxes for `-b`/`--box <name>` (`<name>.config.mjs`) | `~/.config/clabox/configs` |
+| `CLABOX_CWD` | working dir to run `claude` in (also the RW project dir); `~` expanded | — (the shell CWD) |
 | `CLABOX_HOOKS_DIR` | hooks dir (RO + exec inside the sandbox) | — (off) |
 | `CLABOX_DEBUG` | print diagnostics on launch | — |
 | `TMPDIR` | where the generated profile is stored | `/tmp` |

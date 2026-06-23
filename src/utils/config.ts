@@ -33,6 +33,42 @@ export interface BotConfig {
   sshDir: string;
 }
 
+/**
+ * Opt-in marker that turns a box into a standalone Ghostty app. When a box
+ * config carries an `app`, `clabox init` generates a Ghostty config for it and
+ * builds a cloned `<appsDir>/<name>.app` that launches `clabox -b <box>`.
+ */
+export interface AppConfig {
+  /** App display name → `<appsDir>/<name>.app` + CFBundleName. */
+  name: string;
+  /** Ghostty window title. Defaults to {@link AppConfig.name}. */
+  title?: string;
+  /** Emoji for the generated Raycast command. Default: the title's leading emoji. */
+  emoji?: string;
+  /** Path to a `.icns`/`.png` icon for the .app. `.png` is converted. `~` ok. */
+  icon?: string;
+  /** Ghostty built-in `macos-icon` (e.g. `retro`, `holographic`). */
+  macosIcon?: string;
+  /** Extra raw `key = value` lines appended to the generated Ghostty config. */
+  ghostty?: Record<string, string>;
+  /** Bundle id. Default: `com.ghostty.custom.<name dot-joined>`. */
+  bundleId?: string;
+}
+
+/** Machine-wide settings for the `clabox init` Ghostty-app builder. */
+export interface AppBuilderConfig {
+  /** Donor app to clone. `~` is expanded. */
+  ghosttyApp: string;
+  /** Where built apps land. `~` is expanded. */
+  appsDir: string;
+  /** codesign identity. null → ad-hoc (`codesign -s -`). */
+  signId: string | null;
+  /** Optional base Ghostty config emitted as a leading `config-file = …`. */
+  baseGhosttyConfig: string | null;
+  /** `clabox` binary baked into the generated `command`. null → autodetect. */
+  claboxBin: string | null;
+}
+
 /** Extra rules layered on top of the built-in base profile. */
 export interface PathRules {
   /** RW subpaths (beyond project dir + configDir + /tmp). */
@@ -47,6 +83,12 @@ export interface PathRules {
 
 /** Effective clabox configuration. */
 export interface Config {
+  /**
+   * Working directory to run `claude` in (and grant RW as the project dir).
+   * null → the shell's CWD. Handy for named boxes that always target one
+   * project regardless of where `clabox` is invoked from. `~` is expanded.
+   */
+  cwd: string | null;
   /** Path to the `claude` binary. null → autodetect (PATH, then ~/.local/bin). */
   claudeBin: string | null;
   /** Claude config/profile directory — supports multiple accounts. */
@@ -54,6 +96,12 @@ export interface Config {
   /** Extra args always passed to `claude`, before any args from the CLI. */
   claudeArgs: string[];
   bot: BotConfig;
+  /**
+   * Extra environment variables forced onto the sandboxed `claude` process,
+   * layered over the inherited shell env and after the built-in hardening vars
+   * (so a key set here wins). Use it to pass secrets like `GITHUB_TOKEN`.
+   */
+  env: Record<string, string>;
   /** Allow outbound network. `false` → no `(allow network*)` line. */
   network: boolean;
   /** Cap the process table inside the sandbox (fork-bomb guard). 0 → skip. */
@@ -65,10 +113,18 @@ export interface Config {
   denyHome: string[];
   /** Dotfile config dirs under $HOME denied entirely. */
   denyDotConfigs: string[];
+  /**
+   * Opt-in: build a standalone Ghostty app for this box during `clabox init`.
+   * Absent → the box only gets a shell alias (the default).
+   */
+  app?: AppConfig;
+  /** Machine-wide settings for the `clabox init` Ghostty-app builder. */
+  appBuilder: AppBuilderConfig;
 }
 
 /** Built-in defaults. Everything here is meant to be overridable. */
 export const defaultConfig: Config = {
+  cwd: env.CLABOX_CWD ?? null,
   claudeBin: env.CLABOX_CLAUDE_BIN ?? null,
   configDir: env.CLAUDE_CONFIG_DIR ?? '~/.claude',
   claudeArgs: ['--settings', '{"includeCoAuthoredBy": false}'],
@@ -77,6 +133,7 @@ export const defaultConfig: Config = {
     email: env.CLABOX_BOT_EMAIL ?? 'bot@example.com',
     sshDir: env.CLABOX_BOT_SSH_DIR ?? '~/.ssh/claudebot',
   },
+  env: {},
   network: true,
   ulimitProcs: 1024,
   hooksDir: env.CLABOX_HOOKS_DIR ?? null,
@@ -89,6 +146,14 @@ export const defaultConfig: Config = {
   denyHome: ['Documents', 'Desktop', 'Downloads', 'Pictures', 'Movies', 'Music'],
   // `.config/git` is always carved back out for git RO config in the profile.
   denyDotConfigs: ['aws', 'gnupg', 'kube', 'docker', 'config'],
+  // `app` is opt-in per box, so there's no default — it stays undefined.
+  appBuilder: {
+    ghosttyApp: env.CLABOX_GHOSTTY_APP ?? '/Applications/Ghostty.app',
+    appsDir: env.CLABOX_APPS_DIR ?? '~/Applications',
+    signId: env.CLABOX_SIGN_ID ?? null,
+    baseGhosttyConfig: env.CLABOX_GHOSTTY_BASE_CONFIG ?? null,
+    claboxBin: env.CLABOX_CLABOX_BIN ?? null,
+  },
 };
 
 type Plain = Record<string, unknown>;
@@ -127,6 +192,57 @@ export function findConfigFile(explicit?: string | null): string | null {
     path.join(HOME, '.config', 'clabox', 'config.mjs'),
   ];
   return candidates.find((c) => fs.existsSync(c)) ?? null;
+}
+
+/**
+ * Global directory holding named "box" configs (`<name>.config.mjs`), used by
+ * the `clabox --box <name>` / `-b` flag. Override with `CLABOX_CONFIGS_DIR`.
+ */
+export function configsDir(): string {
+  return expandHome(env.CLABOX_CONFIGS_DIR ?? '~/.config/clabox/configs');
+}
+
+const BOX_SUFFIXES = ['.config.mjs', '.mjs'];
+
+/** Candidate file paths for a box name, in resolution order. */
+function boxCandidates(name: string, dir: string): string[] {
+  return BOX_SUFFIXES.map((s) => path.join(dir, `${name}${s}`));
+}
+
+/** Named box configs (sorted, de-duplicated) available in {@link configsDir}. */
+export function listBoxes(dir: string = configsDir()): string[] {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const names = new Set<string>();
+  for (const f of entries) {
+    // `_`-prefixed files are shared partials (e.g. `_presets.mjs`), not boxes.
+    if (f.startsWith('_')) continue;
+    const suffix = BOX_SUFFIXES.find((s) => f.endsWith(s));
+    if (suffix) names.add(f.slice(0, -suffix.length));
+  }
+  return [...names].sort();
+}
+
+/**
+ * Resolve a box name to its config file in {@link configsDir}, preferring
+ * `<name>.config.mjs` over a bare `<name>.mjs`.
+ *
+ * @throws if no matching file exists (the message lists the available boxes).
+ */
+export function resolveBox(name: string, dir: string = configsDir()): string {
+  // `_`-prefixed files are shared partials (e.g. `_presets.mjs`), not boxes —
+  // keep them un-resolvable so `-b` matches what `listBoxes` advertises.
+  if (!name.startsWith('_')) {
+    const found = boxCandidates(name, dir).find((c) => fs.existsSync(c));
+    if (found) return found;
+  }
+  const available = listBoxes(dir);
+  const hint = available.length ? `available: ${available.join(', ')}` : `none found in ${dir}`;
+  throw new Error(`clabox: box '${name}' not found in ${dir} (${hint})`);
 }
 
 /** Result of {@link loadConfig}: the effective config and the file it came from. */

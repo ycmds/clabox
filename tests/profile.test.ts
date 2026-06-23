@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildProfile } from '../src/sandbox/profile.js';
+import { buildEnvArgs, resolveProjectDir } from '../src/sandbox/run.js';
 import { defaultConfig, findConfigFile, mergeConfig } from '../src/utils/config.js';
 
 const PROJECT = '/tmp/sample-project';
@@ -67,6 +68,23 @@ describe('profile text generation', () => {
     }
   });
 
+  test('hard secret deny is emitted AFTER a broad readOnly so it cannot be overridden', () => {
+    // A box may grant read across the whole disk; secrets must still win.
+    const p = build({ paths: { readWrite: [], readOnly: ['/'], exec: [], deny: [] } });
+    const roIdx = p.indexOf('extra read-only paths');
+    const projIdx = p.indexOf('project workspace');
+    const hardIdx = p.indexOf('hard secret DENY');
+    expect(roIdx).toBeGreaterThan(-1);
+    expect(hardIdx).toBeGreaterThan(roIdx);
+    expect(hardIdx).toBeGreaterThan(projIdx);
+    // The credential & private-key denies live in that final, binding block.
+    const tail = p.slice(hardIdx);
+    expect(tail).toContain('(aws|gnupg|kube|docker|config)');
+    expect(tail).toContain('.ssh/id_');
+    expect(tail).toContain('.pem$');
+    expect(tail).toContain('.key$');
+  });
+
   test('hooks dir is off by default and granted when it exists', () => {
     expect(build()).toContain('no hooks dir');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-'));
@@ -75,6 +93,58 @@ describe('profile text generation', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unit: project-dir resolution (config.cwd)
+// ---------------------------------------------------------------------------
+
+describe('resolveProjectDir', () => {
+  test('falls back to the shell CWD when cwd is null', () => {
+    expect(resolveProjectDir(defaultConfig)).toBe(process.cwd());
+  });
+
+  test('uses config.cwd when set', () => {
+    expect(resolveProjectDir(mergeConfig(defaultConfig, { cwd: '/tmp/box-project' }))).toBe(
+      '/tmp/box-project',
+    );
+  });
+
+  test('expands a leading ~ in config.cwd', () => {
+    expect(resolveProjectDir(mergeConfig(defaultConfig, { cwd: '~/box-project' }))).toBe(
+      path.join(os.homedir(), 'box-project'),
+    );
+  });
+
+  test('config.cwd becomes the read-write project dir in the profile', () => {
+    const cfg = mergeConfig(defaultConfig, { cwd: '/tmp/box-project' });
+    const p = buildProfile(cfg, { projectDir: resolveProjectDir(cfg), detectedPaths: [] });
+    expect(p).toContain('(subpath "/tmp/box-project")');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unit: forced environment (buildEnvArgs)
+// ---------------------------------------------------------------------------
+
+describe('buildEnvArgs', () => {
+  test('declared config.env vars are appended as KEY=VALUE', () => {
+    const args = buildEnvArgs(mergeConfig(defaultConfig, { env: { GITHUB_TOKEN: 'ghp_x' } }));
+    expect(args).toContain('GITHUB_TOKEN=ghp_x');
+  });
+
+  test('config.env wins over the built-in hardening vars (appended last)', () => {
+    const args = buildEnvArgs(mergeConfig(defaultConfig, { env: { GIT_AUTHOR_NAME: 'me' } }));
+    // both assignments are present; `env` keeps the last one, so ours wins
+    expect(args.lastIndexOf('GIT_AUTHOR_NAME=me')).toBeGreaterThan(
+      args.indexOf(`GIT_AUTHOR_NAME=${defaultConfig.bot.name}`),
+    );
+  });
+
+  test('no config.env keeps the arg list free of stray entries', () => {
+    const args = buildEnvArgs(defaultConfig);
+    expect(args.some((a) => a.startsWith('GITHUB_TOKEN='))).toBe(false);
   });
 });
 

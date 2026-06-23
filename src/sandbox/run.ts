@@ -15,6 +15,14 @@ export function profilePath(projectDir: string = process.cwd()): string {
   return path.join(TMPDIR, `clabox-${path.basename(projectDir)}-${hash}.sb`);
 }
 
+/**
+ * Effective project dir: `config.cwd` (with `~` expanded, resolved to an
+ * absolute path so SBPL `subpath` rules stay valid) if set, else the shell CWD.
+ */
+export function resolveProjectDir(config: Config): string {
+  return config.cwd ? path.resolve(expandHome(config.cwd)) : process.cwd();
+}
+
 function which(bin: string): string | null {
   try {
     return (
@@ -40,7 +48,10 @@ function resolveClaudeBin(config: Config): string {
 }
 
 /** Generate the profile file for the current project, return its path. */
-export function generateProfile(config: Config, projectDir: string = process.cwd()): string {
+export function generateProfile(
+  config: Config,
+  projectDir: string = resolveProjectDir(config),
+): string {
   requireSandboxExec();
   const file = profilePath(projectDir);
   const text = buildProfile(config, { projectDir, detectedPaths: detectPackagePaths() });
@@ -49,15 +60,13 @@ export function generateProfile(config: Config, projectDir: string = process.cwd
 }
 
 /** Build the `env KEY=VALUE …` argument list forced onto the sandboxed claude. */
-function buildEnvArgs(config: Config): string[] {
+export function buildEnvArgs(config: Config): string[] {
   const sshDir = expandHome(config.bot.sshDir);
   const botKey = path.join(sshDir, 'id_ed25519');
   const botCfg = path.join(sshDir, 'config');
   const args = [
     `PATH=${path.join(HOME, '.local/bin')}:${process.env.PATH || ''}`,
     `CLAUDE_CONFIG_DIR=${expandHome(config.configDir)}`,
-    'DISABLE_AUTOUPDATER=1',
-    'NPM_CONFIG_USERCONFIG=/dev/null',
     `GIT_AUTHOR_NAME=${config.bot.name}`,
     `GIT_AUTHOR_EMAIL=${config.bot.email}`,
     `GIT_COMMITTER_NAME=${config.bot.name}`,
@@ -75,6 +84,11 @@ function buildEnvArgs(config: Config): string[] {
       `GIT_SSH_COMMAND=ssh -F ${botCfg} -i ${botKey} -o IdentitiesOnly=yes -o IdentityAgent=none`,
     );
   }
+  // User-declared extras go last so they win over the built-in vars above
+  // (duplicate keys: `env` keeps the last assignment).
+  for (const [key, value] of Object.entries(config.env ?? {})) {
+    args.push(`${key}=${value}`);
+  }
   return args;
 }
 
@@ -89,7 +103,7 @@ export function runClaude(
   claudeArgs: string[],
   { configFile }: RunOptions = {},
 ): number {
-  const projectDir = process.cwd();
+  const projectDir = resolveProjectDir(config);
   const claudeBin = resolveClaudeBin(config);
   const profileFile = generateProfile(config, projectDir);
 
@@ -121,6 +135,7 @@ export function runClaude(
   // `exec "$@"` keeps argv intact without re-quoting (args start after $0=sh).
   const ulimit = config.ulimitProcs > 0 ? `ulimit -u ${config.ulimitProcs} 2>/dev/null; ` : '';
   const res = spawnSync('/bin/sh', ['-c', `${ulimit}exec "$@"`, 'sh', ...inner], {
+    cwd: projectDir,
     stdio: 'inherit',
   });
   if (res.error) throw res.error;

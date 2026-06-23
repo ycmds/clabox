@@ -251,16 +251,20 @@ export function buildProfile(
     ),
   );
 
-  // Explicit deny list — wins even over allows above.
-  const denyRules = [...config.denyHome.map((d) => subpath(path.join(HOME, d)))];
-  if (config.denyDotConfigs.length) {
-    denyRules.push(regex(`^${homeRe}/\\.(${config.denyDotConfigs.join('|')})($|/)`));
-  }
-  denyRules.push(...config.paths.deny.map((p) => subpath(expandHome(p))));
-  add('explicit sensitive DENY list', deny('file-read* file-write*', ...denyRules));
+  // Soft privacy DENY list — placed BEFORE the extra readOnly/readWrite and the
+  // project dir, so an explicit grant may override it (e.g. running on a project
+  // that lives under ~/Documents). The hard secret deny below is what's binding.
+  const softDeny = [
+    ...config.denyHome.map((d) => subpath(path.join(HOME, d))),
+    ...config.paths.deny.map((p) => subpath(expandHome(p))),
+  ];
+  add(
+    'soft privacy DENY list (overridable by explicit grants)',
+    deny('file-read* file-write*', ...softDeny),
+  );
 
   add(
-    'SSH: bot key only, deny other keys',
+    'SSH: bot key + known_hosts (personal keys hard-denied at the very end)',
     [
       allow(
         'file-read*',
@@ -274,12 +278,6 @@ export function buildProfile(
         'file-write*',
         literal(path.join(HOME, '.ssh/known_hosts')),
         literal(path.join(HOME, '.ssh/known_hosts2')),
-      ),
-      deny(
-        'file-read* file-write*',
-        regex(`^${homeRe}/\\.ssh/id_`),
-        regex(`^${homeRe}/\\.ssh/.*\\.pem$`),
-        regex(`^${homeRe}/\\.ssh/.*\\.key$`),
       ),
     ].join('\n'),
   );
@@ -317,6 +315,25 @@ export function buildProfile(
       allow('file-read* file-write* file-map-executable', subpath(projectDir)),
       allow('process-exec', subpath(projectDir)),
     ].join('\n'),
+  );
+
+  // Hard secret DENY — emitted LAST of all file rules so it wins even over a
+  // broad readOnly/readWrite or the project dir (SBPL = last matching rule
+  // wins). This is the binding invariant: personal credentials and private keys
+  // are never readable, however wide the grants above. Only the bot key subdir
+  // (allowed earlier, and not matched by these patterns) stays readable.
+  const hardDeny: string[] = [];
+  if (config.denyDotConfigs.length) {
+    hardDeny.push(regex(`^${homeRe}/\\.(${config.denyDotConfigs.join('|')})($|/)`));
+  }
+  hardDeny.push(
+    regex(`^${homeRe}/\\.ssh/id_`),
+    regex(`^${homeRe}/\\.ssh/.*\\.pem$`),
+    regex(`^${homeRe}/\\.ssh/.*\\.key$`),
+  );
+  add(
+    'hard secret DENY (always wins — credentials & private keys)',
+    deny('file-read* file-write*', ...hardDeny),
   );
 
   if (config.network) add('networking', '(allow network*)');
