@@ -1,11 +1,12 @@
 # 📦 clabox
 
-[![npm](https://img.shields.io/npm/v/clabox.svg)](https://www.npmjs.com/package/clabox)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%2014%2F15-lightgrey.svg)](#limitations)
-[![Node](https://img.shields.io/badge/node-%3E%3D18-green.svg)](https://nodejs.org)
-[![Runtime deps](https://img.shields.io/badge/runtime%20deps-yargs%20only-success.svg)](package.json)
-[![Ask me in Telegram](https://img.shields.io/badge/Ask%20me%20in-Telegram-0088CC.svg)](https://t.me/isuvorov)
+[![LSK.js](https://github.com/lskjs/presets/raw/main/docs/badge.svg)](https://github.com/lskjs)
+[![NPM version](https://badgen.net/npm/v/clabox)](https://www.npmjs.com/package/clabox)
+[![NPM downloads](https://badgen.net/npm/dt/clabox)](https://www.npmjs.com/package/clabox)
+[![Have TypeScript types](https://badgen.net/npm/types/clabox)](https://www.npmjs.com/package/clabox)
+[![Package size](https://img.shields.io/npm/unpacked-size/clabox?label=size&color=blue)](https://www.npmjs.com/package/clabox)
+[![License](https://badgen.net/github/license/ycmds/clabox)](https://github.com/ycmds/clabox/blob/main/LICENSE)
+[![Write us in Telegram](https://img.shields.io/badge/write%20us-0088CC?logo=telegram&logoColor=white)](https://t.me/isuvorov)
 
 <div align="center">
   <h3><p><strong>🛡️ Run Claude Code in a sandbox for super-safe YOLO mode 🛡️</strong></p></h3>

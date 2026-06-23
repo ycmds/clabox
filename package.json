@@ -113,11 +113,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/isuvorov/clabox.git"
+    "url": "git+https://github.com/ycmds/clabox.git"
   },
-  "homepage": "https://github.com/isuvorov/clabox#readme",
+  "homepage": "https://github.com/ycmds/clabox#readme",
   "bugs": {
-    "url": "https://github.com/isuvorov/clabox/issues"
+    "url": "https://github.com/ycmds/clabox/issues"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.0",
