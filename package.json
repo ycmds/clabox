@@ -1,6 +1,6 @@
 {
   "name": "clabox",
-  "version": "0.1.0",
+  "version": "0.0.2",
   "description": "Run Claude Code in a sandbox for super-safe YOLO mode, configured in plain JavaScript",
   "type": "module",
   "author": "Igor Suvorov",
