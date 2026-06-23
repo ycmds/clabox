@@ -9,13 +9,21 @@ jobs:
     # macOS runner: the functional tests exercise the real `sandbox-exec`.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - uses: actions/setup-node@v4
+
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
-      - run: bun install --frozen-lockfile
-      - run: bun run build
-      - run: bun run test
+          node-version: 22
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run build
+
+      - name: Test
+        run: bun run test
