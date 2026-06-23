@@ -1,0 +1,9 @@
+node_modules/
+lib/
+lib-tsdown/
+lib-tsc/
+coverage/
+*.sb
+*.tgz
+.DS_Store
+**/__*

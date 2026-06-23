@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib-tsc",
+    "declaration": true,
+    "sourceMap": true,
+    "target": "ES2023",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "lib", "lib-tsc", "lib-tsdown", "tests"]
+}
