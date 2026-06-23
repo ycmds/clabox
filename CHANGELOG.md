@@ -1,3 +1,10 @@
+## [0.1.1](https://github.com/ycmds/clabox/compare/v0.1.0...v0.1.1) (2026-06-23)
+
+
+### Bug Fixes
+
+* app icons ([e7dd519](https://github.com/ycmds/clabox/commit/e7dd51927ee12e0d7e9cb0f53b5eba79456e690c))
+
 # [0.1.0](https://github.com/ycmds/clabox/compare/v0.0.2...v0.1.0) (2026-06-23)
 
 
