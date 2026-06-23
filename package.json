@@ -72,26 +72,37 @@
     {
       "path": "lib/index.js",
       "limit": "10 kb",
-      "ignore": ["node:*"]
+      "ignore": [
+        "node:*"
+      ]
     }
   ],
   "dependencies": {
     "yargs": "^17.7.2"
   },
   "release": {
-    "branches": ["main"],
+    "branches": [
+      "main"
+    ],
     "plugins": [
       "@semantic-release/commit-analyzer",
       "@semantic-release/release-notes-generator",
       "@semantic-release/changelog",
-      ["@semantic-release/npm", {
-        "npmPublish": true
-      }],
+      [
+        "@semantic-release/npm",
+        {
+          "npmPublish": true
+        }
+      ],
       "@semantic-release/github",
       [
         "@semantic-release/git",
         {
-          "assets": ["package.json", "CHANGELOG.md", "bun.lock"],
+          "assets": [
+            "package.json",
+            "CHANGELOG.md",
+            "bun.lock"
+          ],
           "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
         }
       ]
