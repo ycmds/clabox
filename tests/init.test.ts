@@ -6,10 +6,12 @@
 // throwaway tmp dir and re-reads it. Nothing here runs claude or sandbox-exec.
 
 import { describe, expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { aliasName, buildAliasFiles, buildIndex, buildWrapper } from '../src/init/aliases.js';
+import { installIcon } from '../src/init/app.js';
 import {
   appBundlePath,
   buildCommand,
@@ -191,7 +193,7 @@ describe('ghostty config + launcher generation', () => {
 
   test('buildCommand cds into the project and runs clabox -b <box>', () => {
     expect(buildCommand(opts)).toBe(
-      "command = bash -c 'cd /Users/me/projects/ax-mg && " +
+      "command = zsh -lic 'cd /Users/me/projects/ax-mg && " +
         "CLABOX_CONFIGS_DIR=/Users/me/.config/clabox/configs /Users/me/.bun/bin/clabox -b ax-mg; exec zsh'",
     );
   });
@@ -236,6 +238,52 @@ describe('ghostty config + launcher generation', () => {
     );
     expect(bundleId('ax-mg', app)).toBe('com.ghostty.custom.ax.mg');
     expect(bundleId('ax-mg', { ...app, bundleId: 'com.me.ax' })).toBe('com.me.ax');
+  });
+});
+
+describe('installIcon (real plutil, macOS only)', () => {
+  const isMac = process.platform === 'darwin';
+
+  // Ghostty ships both CFBundleIconName (→ Assets.car) and the loose
+  // CFBundleIconFile; macOS prefers the asset-catalog name, so installing the
+  // .icns is not enough — the name must be removed for our icon to win.
+  test.skipIf(!isMac)('replaces the loose .icns and drops CFBundleIconName', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-icon-'));
+    try {
+      const appPath = path.join(base, 'Test.app');
+      const resources = path.join(appPath, 'Contents', 'Resources');
+      fs.mkdirSync(resources, { recursive: true });
+      const plist = path.join(appPath, 'Contents', 'Info.plist');
+      fs.writeFileSync(
+        plist,
+        `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIconFile</key><string>Ghostty</string>
+<key>CFBundleIconName</key><string>Ghostty</string>
+</dict></plist>`,
+      );
+      // an old icns that installIcon must overwrite (named per CFBundleIconFile)
+      const icns = path.join(resources, 'Ghostty.icns');
+      fs.writeFileSync(icns, 'OLD');
+      const src = path.join(base, 'mine.icns');
+      fs.writeFileSync(src, 'NEWICON');
+
+      installIcon({ name: 'Test', icon: src }, appPath, base);
+
+      expect(fs.readFileSync(icns, 'utf8')).toBe('NEWICON');
+      // CFBundleIconName gone → plutil -extract now fails
+      expect(() =>
+        execFileSync('plutil', ['-extract', 'CFBundleIconName', 'raw', plist], { stdio: 'ignore' }),
+      ).toThrow();
+      // the loose CFBundleIconFile is left intact
+      const iconFile = execFileSync('plutil', ['-extract', 'CFBundleIconFile', 'raw', plist], {
+        encoding: 'utf8',
+      }).trim();
+      expect(iconFile).toBe('Ghostty');
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 

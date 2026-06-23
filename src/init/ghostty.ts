@@ -24,11 +24,15 @@ export interface GhosttyConfigOptions {
   baseGhosttyConfig?: string | null;
 }
 
-/** The `command = bash -c '…'` line that boots clabox for the box. */
+/** The `command = zsh -lic '…'` line that boots clabox for the box. */
 export function buildCommand(opts: GhosttyConfigOptions): string {
   const cd = opts.projectDir ? `cd ${opts.projectDir} && ` : '';
   const inner = `${cd}CLABOX_CONFIGS_DIR=${opts.configsDir} ${opts.claboxBin} -b ${opts.boxName}; exec zsh`;
-  return `command = bash -c '${inner}'`;
+  // Login + interactive zsh so the GUI-launched app inherits the user's PATH
+  // (/etc/zprofile→path_helper for Homebrew, ~/.zshrc for fnm/nvm/volta). A bare
+  // `bash -c` gets only launchd's minimal PATH and can't find `node` (clabox's
+  // shebang is `#!/usr/bin/env node`).
+  return `command = zsh -lic '${inner}'`;
 }
 
 /** Build the Ghostty config text for an app box. */

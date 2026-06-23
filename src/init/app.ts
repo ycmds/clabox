@@ -109,19 +109,25 @@ function pngToIcns(png: string, out: string, tmpDir: string): void {
 }
 
 /** Install the box icon into the cloned bundle, if `app.icon` is set. */
-function installIcon(app: AppConfig, appPath: string, tmpDir: string): void {
+export function installIcon(app: AppConfig, appPath: string, tmpDir: string): void {
   if (!app.icon) return;
   const icon = expandHome(app.icon);
   if (!fs.existsSync(icon)) throw new Error(`icon not found: ${app.icon}`);
-  const dest = path.join(
-    appPath,
-    'Contents',
-    'Resources',
-    iconResourceName(path.join(appPath, 'Contents', 'Info.plist')),
-  );
+  const plist = path.join(appPath, 'Contents', 'Info.plist');
+  const dest = path.join(appPath, 'Contents', 'Resources', iconResourceName(plist));
   if (icon.endsWith('.icns')) fs.copyFileSync(icon, dest);
   else if (icon.endsWith('.png')) pngToIcns(icon, dest, tmpDir);
   else throw new Error(`unsupported icon type (need .icns/.png): ${app.icon}`);
+
+  // Ghostty ships a compiled asset catalog (Assets.car) and a `CFBundleIconName`
+  // pointing into it, which macOS prefers over the loose `CFBundleIconFile`
+  // .icns we just replaced — so our icon would be ignored. Drop the asset-catalog
+  // reference so macOS falls back to the .icns. (May be absent on other donors.)
+  try {
+    run('plutil', ['-remove', 'CFBundleIconName', plist]);
+  } catch {
+    // donor app may not define CFBundleIconName — ignore
+  }
 }
 
 /**
