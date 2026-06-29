@@ -24,7 +24,8 @@ export function resolveProjectDir(config: Config): string {
   return config.cwd ? path.resolve(expandHome(config.cwd)) : process.cwd();
 }
 
-function which(bin: string): string | null {
+/** Resolve a binary via the shell's `command -v`; null if not on PATH. */
+export function which(bin: string): string | null {
   try {
     return (
       execFileSync('command', ['-v', bin], { shell: '/bin/sh', encoding: 'utf8' }).trim() || null

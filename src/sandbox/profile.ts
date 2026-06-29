@@ -59,7 +59,6 @@ export function buildProfile(
 ): string {
   const configDir = expandHome(config.configDir);
   const sshDir = expandHome(config.bot.sshDir);
-  const hooksDir = config.hooksDir ? expandHome(config.hooksDir) : null;
   const homeRe = reEscape(HOME);
 
   const sections: string[] = [];
@@ -282,17 +281,10 @@ export function buildProfile(
     ].join('\n'),
   );
 
-  add(
-    'claude hooks (RO + exec)',
-    hooksDir && fs.existsSync(hooksDir)
-      ? [
-          allow('file-read* file-map-executable', subpath(hooksDir)),
-          allow('process-exec', subpath(hooksDir)),
-        ].join('\n')
-      : ';; (no hooks dir; set config.hooksDir / CLABOX_HOOKS_DIR to enable)',
-  );
-
-  // Extra user-supplied RO / RW / exec rules.
+  // Extra user-supplied RO / RW / exec rules. Hook scripts that claude must run
+  // inside the sandbox are granted via `paths.exec` (read via `paths.readOnly`).
+  // Compiled hooks (config.hooks) only register the script with claude — the
+  // sandbox still needs an exec grant for the script's path to actually run.
   if (config.paths.readOnly.length)
     add(
       'extra read-only paths',

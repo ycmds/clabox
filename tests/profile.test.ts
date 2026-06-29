@@ -84,16 +84,6 @@ describe('profile text generation', () => {
     expect(tail).toContain('.pem$');
     expect(tail).toContain('.key$');
   });
-
-  test('hooks dir is off by default and granted when it exists', () => {
-    expect(build()).toContain('no hooks dir');
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-'));
-    try {
-      expect(build({ hooksDir: dir })).toContain(`(subpath "${dir}")`);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
 });
 
 // ---------------------------------------------------------------------------

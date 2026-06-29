@@ -65,7 +65,7 @@ export interface AppBuilderConfig {
   signId: string | null;
   /** Optional base Ghostty config emitted as a leading `config-file = …`. */
   baseGhosttyConfig: string | null;
-  /** `clabox` binary baked into the generated `command`. null → autodetect. */
+  /** Absolute `clabox` path to pin in the generated `command`. null → bare `clabox` (PATH-resolved at launch). */
   claboxBin: string | null;
 }
 
@@ -83,13 +83,35 @@ export interface McpServer {
   headers?: Record<string, string>;
 }
 
+/** A single hook command — one entry in claude's settings.json hook list. */
+export interface HookCommand {
+  type: 'command';
+  /** Shell command to run (e.g. an absolute path to a script). */
+  command: string;
+  /** Optional per-command timeout in seconds. */
+  timeout?: number;
+}
+
+/** A matcher group under a hook event. */
+export interface HookMatcher {
+  /** Tool-name matcher for `PreToolUse`/`PostToolUse`; omit for `Stop`/`Notification`/… */
+  matcher?: string;
+  hooks: HookCommand[];
+}
+
+/**
+ * Per-box hooks, mirroring claude's settings.json `hooks` map: an event name
+ * (`Stop`, `Notification`, `PreToolUse`, …) → its matcher groups.
+ */
+export type HooksConfig = Record<string, HookMatcher[]>;
+
 /** Extra rules layered on top of the built-in base profile. */
 export interface PathRules {
   /** RW subpaths (beyond project dir + configDir + /tmp). */
   readWrite: string[];
   /** RO subpaths. */
   readOnly: string[];
-  /** process-exec subpaths. */
+  /** process-exec subpaths (e.g. a hook-scripts dir so `config.hooks` can run). */
   exec: string[];
   /** explicit deny subpaths (read + write). */
   deny: string[];
@@ -123,6 +145,14 @@ export interface Config {
    * sharing one configDir (the user-level CLAUDE.md is shared; this is not).
    */
   systemPrompt?: string | string[];
+  /**
+   * Per-box hooks (claude's settings.json `hooks` map). clabox merges them into
+   * a settings JSON written to `<configDir>/settings/<slug>.json` and launches
+   * claude with `--settings <file>` — merging (not clobbering) any inline
+   * `--settings` already in `claudeArgs`, so `includeCoAuthoredBy` survives.
+   * Materialized on every `run` and during `init`. Absent → no settings flag.
+   */
+  hooks?: HooksConfig;
   bot: BotConfig;
   /**
    * Extra environment variables forced onto the sandboxed `claude` process,
@@ -134,8 +164,6 @@ export interface Config {
   network: boolean;
   /** Cap the process table inside the sandbox (fork-bomb guard). 0 → skip. */
   ulimitProcs: number;
-  /** Extra directory granted read + execute inside the sandbox. null → disabled. */
-  hooksDir: string | null;
   paths: PathRules;
   /** Home subdirectories denied entirely (read + write). */
   denyHome: string[];
@@ -164,7 +192,6 @@ export const defaultConfig: Config = {
   env: {},
   network: true,
   ulimitProcs: 1024,
-  hooksDir: env.CLABOX_HOOKS_DIR ?? null,
   paths: {
     readWrite: [],
     readOnly: [],

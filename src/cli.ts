@@ -6,8 +6,10 @@
 // ~/.config/clabox/config.mjs. See clabox.config.example.mjs.
 
 import path from 'node:path';
+import { createLogger } from '@lsk4/log';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
+import { formatInfo, gatherInfo } from './info/info.js';
 import { runInit } from './init/scaffold.js';
 import { generateProfile, profilePath, resolveProjectDir, runClaude } from './sandbox/run.js';
 import { loadConfig, resolveBox } from './utils/config.js';
@@ -76,6 +78,22 @@ await yargs(hideBin(process.argv))
     },
   )
   .command(
+    'info',
+    'Print clabox/version/box/config diagnostics for the resolved config',
+    (y) => y,
+    async (argv) => {
+      const { config, configFile } = await loadConfig(explicitConfig(argv));
+      const data = gatherInfo(config, { configFile, box: argv.box as string | undefined });
+      const log = createLogger('clabox');
+      // `.log` is the raw passthrough — keeps the aligned table intact (vs. the
+      // per-line `ℹ clabox` prefix of `.info`); colorize only for a real TTY.
+      log.log(formatInfo(data, { color: Boolean(process.stdout.isTTY) }));
+      // Surface a hard blocker as a real warn (clabox can't run without these).
+      if (!data.claudeBin) log.warn('claude binary not found on PATH');
+      if (!data.sandboxExec) log.warn('sandbox-exec not found — clabox needs macOS');
+    },
+  )
+  .command(
     'init',
     'Generate clabox-<name> shell aliases and build Ghostty apps for `app` boxes',
     (y) =>
@@ -114,6 +132,7 @@ await yargs(hideBin(process.argv))
   )
   .example('$0 run --dangerously-skip-permissions', 'YOLO mode inside the sandbox')
   .example('$0 -b ax-root', 'Run the ~/.config/clabox/configs/ax-root.config.mjs box')
+  .example('$0 info', 'Print version/box/config diagnostics for the resolved config')
   .example('$0 init', 'Generate shell aliases from ~/.config/clabox/configs/*.config.mjs')
   .example('$0 --config ./my.clabox.mjs run', 'Use a specific JS config file')
   .example('CLAUDE_CONFIG_DIR=~/.claude_work $0 run', 'Use a different Claude profile')

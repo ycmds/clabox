@@ -142,7 +142,12 @@ export function buildApp(opts: BuildAppOptions): BuildAppResult {
   const ghosttyApp = expandHome(builder.ghosttyApp);
   const appsDir = expandHome(builder.appsDir);
   const appPath = appBundlePath(appsDir, app);
-  const plist = path.join(appPath, 'Contents', 'Info.plist');
+  // Build into a staging clone next to the final bundle (same filesystem → the
+  // final rename is atomic) and only swap it in once every step has succeeded.
+  // A failed build (e.g. an unreadable donor) must never destroy an existing
+  // working bundle — so we touch `appPath` only at the very end.
+  const stagePath = `${appPath}.new`;
+  const plist = path.join(stagePath, 'Contents', 'Info.plist');
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clabox-app-'));
 
   try {
@@ -150,8 +155,8 @@ export function buildApp(opts: BuildAppOptions): BuildAppResult {
 
     // Full clone (cp -R keeps bundle symlinks/frameworks intact).
     fs.mkdirSync(appsDir, { recursive: true });
-    fs.rmSync(appPath, { recursive: true, force: true });
-    run('cp', ['-R', ghosttyApp, appPath]);
+    fs.rmSync(stagePath, { recursive: true, force: true });
+    run('cp', ['-R', ghosttyApp, stagePath]);
 
     // Identity.
     run('plutil', ['-replace', 'CFBundleIdentifier', '-string', bundleId(boxName, app), plist]);
@@ -168,23 +173,31 @@ export function buildApp(opts: BuildAppOptions): BuildAppResult {
     }
 
     // Swap the binary for a launcher that prepends --config-file.
-    const bin = path.join(appPath, 'Contents', 'MacOS', 'ghostty');
+    const bin = path.join(stagePath, 'Contents', 'MacOS', 'ghostty');
     fs.renameSync(bin, `${bin}.real`);
     const src = path.join(tmpDir, 'launcher.c');
     fs.writeFileSync(src, buildLauncherSource(configPath));
     run('cc', ['-o', bin, src]);
 
-    installIcon(app, appPath, tmpDir);
+    installIcon(app, stagePath, tmpDir);
 
-    // Re-sign: inner real binary first, then the whole bundle.
+    // Re-sign: inner real binary first, then the whole bundle. (The signature
+    // seals the bundle contents, not its directory name, so the rename below
+    // keeps it valid.)
     const signId = builder.signId;
     const entArgs = entitlements ? ['--entitlements', entitlements] : [];
     const idArgs = signId ? ['--sign', signId] : ['--sign', '-'];
     run('codesign', ['--force', ...idArgs, ...entArgs, `${bin}.real`]);
-    run('codesign', ['--force', '--deep', ...idArgs, ...entArgs, appPath]);
+    run('codesign', ['--force', '--deep', ...idArgs, ...entArgs, stagePath]);
+
+    // Everything succeeded — atomically replace the previous bundle.
+    fs.rmSync(appPath, { recursive: true, force: true });
+    fs.renameSync(stagePath, appPath);
 
     return { appPath, signed: signId ? 'identity' : 'adhoc' };
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    // Clean a leftover stage from a failed build (no-op after a successful swap).
+    fs.rmSync(stagePath, { recursive: true, force: true });
   }
 }

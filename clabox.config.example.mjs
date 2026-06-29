@@ -40,14 +40,20 @@ export default {
   // Process-table cap inside the sandbox (fork-bomb guard); 0 to disable.
   ulimitProcs: 1024,
 
-  // Extra directory granted read + execute (e.g. shared Claude hooks).
-  hooksDir: null, // '~/some/hooks'
+  // Per-box claude hooks (claude's settings.json `hooks` map). clabox merges
+  // them into a `--settings` file. For a hook script to actually run inside the
+  // sandbox its dir must also be granted read (`paths.readOnly`) + exec
+  // (`paths.exec`) below — `hooks` only registers it with claude.
+  // hooks: {
+  //   Stop: [{ hooks: [{ type: 'command', command: '~/some/hooks/notify.sh' }] }],
+  //   Notification: [{ hooks: [{ type: 'command', command: '~/some/hooks/notify.sh' }] }],
+  // },
 
   // Extra rules layered on top of the base profile.
   paths: {
     readWrite: [], // e.g. ['~/scratch', '/Volumes/work']
-    readOnly: [], // e.g. ['~/reference-data']
-    exec: [], // e.g. ['/opt/some/tool/bin']
+    readOnly: [], // e.g. ['~/reference-data', '~/some/hooks']
+    exec: [], // e.g. ['/opt/some/tool/bin', '~/some/hooks'] (so hooks can run)
     deny: [], // e.g. ['~/secret-project']
   },
 

@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { aliasName, buildAliasFiles, buildIndex, buildWrapper } from '../src/init/aliases.js';
-import { installIcon } from '../src/init/app.js';
+import { buildApp, installIcon } from '../src/init/app.js';
 import {
   appBundlePath,
   buildCommand,
@@ -351,6 +351,50 @@ describe('installIcon (real plutil, macOS only)', () => {
         encoding: 'utf8',
       }).trim();
       expect(iconFile).toBe('Ghostty');
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('buildApp (non-destructive on failure)', () => {
+  // A failed build must never destroy an existing working bundle: the clone is
+  // staged next to the target and only swapped in after every step succeeds.
+  // Off macOS this fails at the canBuildApps gate; on macOS the staged clone
+  // fails at the first plutil step (the donor isn't a real bundle). Either way
+  // the pre-existing bundle and its sentinel must survive, and no `.new` stage
+  // must be left behind.
+  test('a failed build leaves the existing bundle (and its contents) intact', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-build-'));
+    try {
+      const appsDir = path.join(base, 'apps');
+      const appPath = path.join(appsDir, 'Test Mgr.app');
+      fs.mkdirSync(path.join(appPath, 'Contents'), { recursive: true });
+      fs.writeFileSync(path.join(appPath, 'Contents', 'SENTINEL'), 'keep me');
+      // A donor that exists (passes the existsSync check) but isn't a real
+      // Ghostty bundle, so the build throws partway through.
+      const donor = path.join(base, 'FakeGhostty.app');
+      fs.mkdirSync(donor, { recursive: true });
+
+      expect(() =>
+        buildApp({
+          boxName: 'mgr',
+          app: { name: 'Test Mgr' },
+          configPath: path.join(base, 'mgr.config'),
+          builder: {
+            ghosttyApp: donor,
+            appsDir,
+            signId: null,
+            baseGhosttyConfig: null,
+            claboxBin: null,
+          },
+        }),
+      ).toThrow();
+
+      // The original bundle survived untouched…
+      expect(fs.readFileSync(path.join(appPath, 'Contents', 'SENTINEL'), 'utf8')).toBe('keep me');
+      // …and no staging clone was orphaned.
+      expect(fs.existsSync(`${appPath}.new`)).toBe(false);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

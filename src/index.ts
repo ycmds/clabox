@@ -3,6 +3,16 @@
 // library, not just the `clabox` CLI.
 
 export {
+  type ClaboxPackage,
+  claboxVersion,
+  type FormatInfoOptions,
+  formatInfo,
+  type GatherInfoOptions,
+  gatherInfo,
+  type InfoData,
+  resolveClaboxPackage,
+} from './info/info.js';
+export {
   type AliasPaths,
   aliasName,
   buildAliasFiles,
@@ -59,6 +69,7 @@ export {
   type RunOptions,
   resolveProjectDir,
   runClaude,
+  which,
 } from './sandbox/run.js';
 export {
   type AppBuilderConfig,

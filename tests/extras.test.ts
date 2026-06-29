@@ -1,5 +1,5 @@
-// Tests for per-box "extras" — the declarative `mcp` / `systemPrompt` config
-// compiled into claude args (+ the materialized MCP json).
+// Tests for per-box "extras" — the declarative `mcp` / `systemPrompt` / `hooks`
+// config compiled into claude args (+ the materialized MCP / settings json).
 //
 //   bun test
 
@@ -71,6 +71,36 @@ describe('buildBoxExtras — systemPrompt', () => {
   });
 });
 
+describe('buildBoxExtras — hooks', () => {
+  const stopHook = {
+    Stop: [{ hooks: [{ type: 'command' as const, command: '/h/notify.sh' }] }],
+  };
+
+  test('compiles hooks to <configDir>/settings/<slug>.json and adds --settings', () => {
+    // claudeArgs: [] → no inline --settings to merge, so the file is hooks-only.
+    const { claudeArgs, files } = buildBoxExtras(cfg({ claudeArgs: [], hooks: stopHook }), 'is-mg');
+    const settingsFile = path.join('/cfg', 'settings', 'is-mg.json');
+    expect(claudeArgs).toEqual(['--settings', settingsFile]);
+    expect(files).toHaveLength(1);
+    expect(files[0].path).toBe(settingsFile);
+    expect(JSON.parse(files[0].content)).toEqual({ hooks: stopHook });
+  });
+
+  test('merges hooks into the inline --settings instead of clobbering it', () => {
+    const claudeArgs = ['--settings', '{"includeCoAuthoredBy": false}', '--foo'];
+    const { files } = buildBoxExtras(cfg({ claudeArgs, hooks: stopHook }), 'b');
+    expect(JSON.parse(files[0].content)).toEqual({
+      includeCoAuthoredBy: false,
+      hooks: stopHook,
+    });
+  });
+
+  test('no settings flag or file when hooks is absent or empty', () => {
+    expect(buildBoxExtras(cfg({}), 's')).toEqual({ claudeArgs: [], files: [] });
+    expect(buildBoxExtras(cfg({ hooks: {} }), 's')).toEqual({ claudeArgs: [], files: [] });
+  });
+});
+
 describe('buildBoxExtras — combined', () => {
   test('emits MCP flags first, then the system prompt', () => {
     const { claudeArgs } = buildBoxExtras(
@@ -83,6 +113,23 @@ describe('buildBoxExtras — combined', () => {
       path.join('/cfg', 'mcp', 'box.json'),
       '--append-system-prompt',
       'hi',
+    ]);
+  });
+
+  test('emits MCP, then system prompt, then --settings (hooks) last', () => {
+    const hooks = { Stop: [{ hooks: [{ type: 'command' as const, command: '/h/n.sh' }] }] };
+    const { claudeArgs } = buildBoxExtras(
+      cfg({ mcp: { a: { url: 'u' } }, systemPrompt: 'hi', hooks }),
+      'box',
+    );
+    expect(claudeArgs).toEqual([
+      '--strict-mcp-config',
+      '--mcp-config',
+      path.join('/cfg', 'mcp', 'box.json'),
+      '--append-system-prompt',
+      'hi',
+      '--settings',
+      path.join('/cfg', 'settings', 'box.json'),
     ]);
   });
 });

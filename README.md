@@ -125,7 +125,6 @@ export default {
 | `CLABOX_CONFIG` | path to the JS config file (the `--config` flag overrides it) | — |
 | `CLABOX_CONFIGS_DIR` | global dir of named boxes for `-b`/`--box <name>` (`<name>.config.mjs`) | `~/.config/clabox/configs` |
 | `CLABOX_CWD` | working dir to run `claude` in (also the RW project dir); `~` expanded | — (the shell CWD) |
-| `CLABOX_HOOKS_DIR` | hooks dir (RO + exec inside the sandbox) | — (off) |
 | `CLABOX_DEBUG` | print diagnostics on launch | — |
 | `TMPDIR` | where the generated profile is stored | `/tmp` |
 

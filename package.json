@@ -78,6 +78,7 @@
     }
   ],
   "dependencies": {
+    "@lsk4/log": "^4.28.0",
     "yargs": "^17.7.2"
   },
   "release": {
