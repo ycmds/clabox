@@ -6,7 +6,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { buildBoxExtras } from '../sandbox/extras.js';
-import { type Config, expandHome, listBoxes, loadConfig, resolveBox } from '../utils/config.js';
+import {
+  type Config,
+  expandHome,
+  configsDir as globalConfigsDir,
+  listBoxes,
+  loadConfig,
+  resolveBox,
+} from '../utils/config.js';
 import { buildAliasFiles } from './aliases.js';
 import { buildApp, canBuildApps } from './app.js';
 import { appBundlePath, buildGhosttyConfig } from './ghostty.js';
@@ -78,9 +85,19 @@ function bakeConfigsDir(dir: string): string | null {
   return dir;
 }
 
+/**
+ * Default base dir for `init`: the parent of the global configs dir — i.e.
+ * `~/.config/clabox` (or the parent of `CLABOX_CONFIGS_DIR`). This keeps `init`
+ * in sync with the dir `-b` resolves boxes from, so `clabox init` works from any
+ * cwd. Override with `--dir` for a project-local `<dir>/configs` layout.
+ */
+export function defaultBaseDir(): string {
+  return path.dirname(globalConfigsDir());
+}
+
 /** Options for {@link runInit}. */
 export interface InitOptions {
-  /** Base dir holding `configs/` and `scripts/`. Default: `<cwd>/__`. */
+  /** Base dir holding `configs/` and `scripts/`. Default: {@link defaultBaseDir}. */
   baseDir?: string;
   /** Build the Ghostty apps for `app` boxes. Default: true. */
   buildApps?: boolean;
@@ -215,7 +232,7 @@ export async function runInit({
   buildApps = true,
   only = null,
 }: InitOptions = {}): Promise<InitResult> {
-  const base = path.resolve(baseDir ?? path.join(process.cwd(), '__'));
+  const base = path.resolve(baseDir ?? defaultBaseDir());
   const configsDir = path.join(base, 'configs');
   const scriptsDir = path.join(base, 'scripts');
   const profiles = discoverProfiles(configsDir);

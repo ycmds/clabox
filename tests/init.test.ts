@@ -20,7 +20,7 @@ import {
   bundleId,
 } from '../src/init/ghostty.js';
 import { buildRaycastCommand, raycastIcon } from '../src/init/raycast.js';
-import { discoverProfiles, runInit } from '../src/init/scaffold.js';
+import { defaultBaseDir, discoverProfiles, runInit } from '../src/init/scaffold.js';
 import type { AppConfig } from '../src/utils/config.js';
 
 const PATHS = { configsDir: '/repo/__/configs', scriptsDir: '/repo/__/scripts' };
@@ -60,6 +60,30 @@ describe('alias text generation', () => {
     const names = files.map((f) => path.basename(f.path)).sort();
     expect(names).toEqual(['clabox-ax-safe.sh', 'clabox-ax.sh', 'index.sh']);
     expect(files.every((f) => f.executable)).toBe(true);
+  });
+});
+
+describe('defaultBaseDir (init root defaults to the global configs parent)', () => {
+  test('defaults to ~/.config/clabox (parent of the global configs dir)', () => {
+    const prev = process.env.CLABOX_CONFIGS_DIR;
+    delete process.env.CLABOX_CONFIGS_DIR;
+    try {
+      expect(defaultBaseDir()).toBe(path.join(os.homedir(), '.config', 'clabox'));
+    } finally {
+      if (prev === undefined) delete process.env.CLABOX_CONFIGS_DIR;
+      else process.env.CLABOX_CONFIGS_DIR = prev;
+    }
+  });
+
+  test('honors CLABOX_CONFIGS_DIR (uses its parent)', () => {
+    const prev = process.env.CLABOX_CONFIGS_DIR;
+    process.env.CLABOX_CONFIGS_DIR = '/custom/root/configs';
+    try {
+      expect(defaultBaseDir()).toBe('/custom/root');
+    } finally {
+      if (prev === undefined) delete process.env.CLABOX_CONFIGS_DIR;
+      else process.env.CLABOX_CONFIGS_DIR = prev;
+    }
   });
 });
 

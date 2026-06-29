@@ -82,7 +82,7 @@ await yargs(hideBin(process.argv))
       y
         .option('dir', {
           type: 'string',
-          describe: 'Base dir holding configs/ and scripts/ (default: ./__)',
+          describe: 'Base dir holding configs/ and scripts/ (default: ~/.config/clabox)',
         })
         .option('apps', {
           type: 'boolean',
@@ -114,7 +114,7 @@ await yargs(hideBin(process.argv))
   )
   .example('$0 run --dangerously-skip-permissions', 'YOLO mode inside the sandbox')
   .example('$0 -b ax-root', 'Run the ~/.config/clabox/configs/ax-root.config.mjs box')
-  .example('$0 init', 'Generate shell aliases from __/configs/*.config.mjs')
+  .example('$0 init', 'Generate shell aliases from ~/.config/clabox/configs/*.config.mjs')
   .example('$0 --config ./my.clabox.mjs run', 'Use a specific JS config file')
   .example('CLAUDE_CONFIG_DIR=~/.claude_work $0 run', 'Use a different Claude profile')
   .epilogue(
