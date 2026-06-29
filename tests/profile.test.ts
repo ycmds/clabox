@@ -19,6 +19,22 @@ const PROJECT = '/tmp/sample-project';
 const build = (over: Record<string, unknown> = {}) =>
   buildProfile(mergeConfig(defaultConfig, over), { projectDir: PROJECT, detectedPaths: [] });
 
+/** A canonical (symlink-resolved) tmp dir — macOS `os.tmpdir()` is under /var. */
+const realTmp = (prefix: string): string =>
+  fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+
+/** Run `fn` with CLABOX_CONFIGS_DIR pinned (so claboxHomeDir() is deterministic). */
+function withConfigsDir(dir: string, fn: () => void): void {
+  const prev = process.env.CLABOX_CONFIGS_DIR;
+  process.env.CLABOX_CONFIGS_DIR = dir;
+  try {
+    fn();
+  } finally {
+    if (prev === undefined) delete process.env.CLABOX_CONFIGS_DIR;
+    else process.env.CLABOX_CONFIGS_DIR = prev;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Unit: profile text generation
 // ---------------------------------------------------------------------------
@@ -43,6 +59,13 @@ describe('profile text generation', () => {
 
   test('Claude config dir is mounted read-write', () => {
     expect(build({ configDir: '/tmp/cfgdir' })).toContain('(subpath "/tmp/cfgdir")');
+  });
+
+  test('notification banner XPC is granted (terminal-notifier / osascript hooks)', () => {
+    const p = build();
+    expect(p).toContain('(global-name "com.apple.hiservices-xpcservice")');
+    // afplay sound services stay granted too
+    expect(p).toContain('(global-name "com.apple.audio.audiohald")');
   });
 
   test('personal ssh keys are denied while the bot key dir is allowed', () => {
@@ -83,6 +106,46 @@ describe('profile text generation', () => {
     expect(tail).toContain('.ssh/id_');
     expect(tail).toContain('.pem$');
     expect(tail).toContain('.key$');
+  });
+
+  test('clabox home gets a RW grant re-issued AFTER the hard deny', () => {
+    // The clabox home (box configs + compiled mcp/settings) lives under
+    // ~/.config/clabox, which the hard `.config` deny blocks; the carve-out must
+    // come AFTER it (last-match-wins) to be usable in-box, and is read+write so a
+    // box can edit its own configs. Pin a plain (non-symlink) configs dir so the
+    // grant is exactly the nominal home — the symlinked case is covered below.
+    const home = `${realTmp('cb-extras-')}`;
+    withConfigsDir(`${home}/configs`, () => {
+      const p = build();
+      const rw = ['(allow file-read* file-write*', `  (subpath "${home}")`, ')'].join('\n');
+      const ex = ['(allow process-exec', `  (subpath "${home}")`, ')'].join('\n');
+      expect(p).toContain(rw);
+      expect(p).toContain(ex);
+      expect(p.indexOf(rw)).toBeGreaterThan(p.indexOf('hard secret DENY'));
+    });
+  });
+
+  test('a symlinked clabox home also grants the resolved real home', () => {
+    // When ~/.config/clabox is a symlink (e.g. relocated into a project repo) the
+    // configs + compiled extras physically live at the target. Seatbelt matches
+    // the symlink-resolved path, so the profile must grant THAT too — else the
+    // in-box read/write is denied (EPERM). Both the nominal and the resolved
+    // grants must land after the hard deny (last-match-wins).
+    const root = realTmp('cb-symhome-');
+    const realHome = path.join(root, 'real-home');
+    const linkHome = path.join(root, 'link-home');
+    fs.mkdirSync(realHome);
+    fs.symlinkSync(realHome, linkHome);
+
+    withConfigsDir(path.join(linkHome, 'configs'), () => {
+      const p = build();
+      const hardIdx = p.indexOf('hard secret DENY');
+      // nominal (symlink) grant stays…
+      expect(p).toContain(`(subpath "${linkHome}")`);
+      // …plus the resolved real home, re-granted after the hard deny.
+      expect(p).toContain(`(subpath "${realHome}")`);
+      expect(p.indexOf(`(subpath "${realHome}")`)).toBeGreaterThan(hardIdx);
+    });
   });
 });
 

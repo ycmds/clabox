@@ -6,7 +6,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { type Config, expandHome, HOME } from '../utils/config.js';
+import { type Config, claboxHomeDir, expandHome, HOME } from '../utils/config.js';
 
 // ---- SBPL helpers ----------------------------------------------------------
 
@@ -40,6 +40,26 @@ export function detectPackagePaths(): string[] {
   if (fs.existsSync(local)) paths.push(local);
   if (fs.existsSync('/nix/store')) paths.push('/nix/store');
   return paths;
+}
+
+/**
+ * The clabox home as it physically resolves on disk, but ONLY when
+ * {@link claboxHomeDir} is a symlink (so the real path differs from the nominal
+ * `~/.config/clabox` one). Used to grant the resolved location in the profile —
+ * the macOS sandbox matches the symlink-resolved path, so a relocated clabox
+ * home (e.g. symlinked into a project repo) would otherwise have its box configs
+ * + compiled `--mcp-config` / `--settings` denied. Best-effort: returns `[]`
+ * when the home is absent or already canonical.
+ */
+export function resolvedClaboxHome(): string[] {
+  const home = claboxHomeDir();
+  let realHome: string;
+  try {
+    realHome = fs.realpathSync(home);
+  } catch {
+    return [];
+  }
+  return realHome === home ? [] : [realHome];
 }
 
 /** Context needed to assemble a profile for a specific project. */
@@ -212,6 +232,18 @@ export function buildProfile(
     ),
   );
 
+  // terminal-notifier / osascript banners post via the high-level-services XPC
+  // (NSUserNotification). Without it they die with:
+  //   "Connection Invalid error for service com.apple.hiservices-xpcservice".
+  // afplay sound is already granted above, so this is what enables sound+banner
+  // for Stop/Notification hooks inside the sandbox. Banner-click→focus is NOT
+  // enabled: that needs appleevent-send to the terminal, which would let a
+  // sandboxed claude script your terminal (a real escape hatch).
+  add(
+    'Notifications (terminal-notifier / osascript banners)',
+    allow('mach-lookup', globalName('com.apple.hiservices-xpcservice')),
+  );
+
   add(
     'Notification Center shared-memory (RO)',
     allow('ipc-posix-shm-read-data', ipcName('apple.shm.notification_center')),
@@ -326,6 +358,33 @@ export function buildProfile(
   add(
     'hard secret DENY (always wins — credentials & private keys)',
     deny('file-read* file-write*', ...hardDeny),
+  );
+
+  // clabox's own home (~/.config/clabox) holds the box configs AND clabox's
+  // compiled extras (mcp/settings json). The hard `.config` deny above blocks
+  // the whole tree, and a user `paths.readWrite` CANNOT help: the hard deny is
+  // emitted LAST and, SBPL being last-match-wins, always beats an earlier grant.
+  // Re-grant READ+WRITE to the clabox home AFTER the hard deny so a box can read
+  // its own `--mcp-config` / `--settings` and edit its own configs in-box. This
+  // is scoped to the `clabox` subdir only — the rest of ~/.config (aws, gnupg,
+  // docker, …) stays denied — and nothing credential-shaped lives here (secrets
+  // come from env, not files), so the hard-deny invariant still holds.
+  //
+  // Seatbelt matches rules against the *real* (symlink-resolved) path of a vnode
+  // — that's why this profile grants both `/tmp` and `/private/tmp`. When
+  // ~/.config/clabox is itself a symlink (e.g. relocated INTO a project so the
+  // box configs + compiled extras live in the repo), the files physically sit at
+  // the symlink target, so the nominal grant never matches and the in-box access
+  // fails with EPERM. Grant the resolved target too.
+  const claboxDirs = [claboxHomeDir(), ...resolvedClaboxHome()];
+  add(
+    'clabox home (box configs + compiled mcp/settings) RW — re-granted after the hard deny',
+    [
+      allow('file-read* file-write*', ...claboxDirs.map(subpath)),
+      // …plus exec, so a box's hook scripts can live in ~/.config/clabox (e.g.
+      // a notify.sh) and actually run in-box without a separate `paths.exec`.
+      allow('process-exec', ...claboxDirs.map(subpath)),
+    ].join('\n'),
   );
 
   if (config.network) add('networking', '(allow network*)');

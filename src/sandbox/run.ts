@@ -96,9 +96,10 @@ export function buildEnvArgs(config: Config): string[] {
 
 /**
  * Write the per-box extra files (mkdir -p their dirs) `0600`. They live under
- * configDir and can carry secrets (e.g. an MCP auth token in a URL/header), so
- * they're kept out of argv (vs. an inline `--mcp-config '<json>'`) AND off the
- * world-readable bit on disk. Returns the paths.
+ * clabox's home (`~/.config/clabox`) and can carry secrets (e.g. an MCP auth
+ * token in a URL/header), so they're kept out of argv (vs. an inline
+ * `--mcp-config '<json>'`) AND off the world-readable bit on disk. Returns the
+ * paths.
  */
 export function writeExtraFiles(files: ExtraFile[]): string[] {
   for (const f of files) {
@@ -125,7 +126,8 @@ export function runClaude(
   const profileFile = generateProfile(config, projectDir);
 
   // Compile the box's declarative mcp / systemPrompt into claude args, and
-  // materialize the files they reference (under configDir, which is sandbox-RW).
+  // materialize the files they reference (under ~/.config/clabox, granted RO
+  // in-box).
   const extras = buildBoxExtras(config, boxSlug(configFile, projectDir));
   const extraFiles = writeExtraFiles(extras.files);
 

@@ -97,7 +97,7 @@ export interface InfoData {
   env: string[];
   /** claude args compiled from this box's mcp/systemPrompt/hooks. */
   extraArgs: string[];
-  /** Files the extras reference (mcp/settings json under configDir). */
+  /** Files the extras reference (mcp/settings json under ~/.config/clabox). */
   extraFiles: string[];
   /** clabox-relevant vars present in the process env (`KEY=VALUE`). */
   processEnv: string[];

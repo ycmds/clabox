@@ -6,9 +6,18 @@
 import { describe, expect, test } from 'bun:test';
 import path from 'node:path';
 import { boxSlug, buildBoxExtras } from '../src/sandbox/extras.js';
-import { type Config, defaultConfig } from '../src/utils/config.js';
+import {
+  type Config,
+  claboxMcpDir,
+  claboxSettingsDir,
+  defaultConfig,
+} from '../src/utils/config.js';
 
-/** A config with a fixed configDir + any overrides for the field under test. */
+/**
+ * A config with a fixed (Claude) configDir + any overrides for the field under
+ * test. The extras now materialize under clabox's own home (`~/.config/clabox`),
+ * NOT this configDir — `/cfg` is kept to assert it no longer affects the paths.
+ */
 function cfg(over: Partial<Config>): Config {
   return { ...defaultConfig, configDir: '/cfg', ...over };
 }
@@ -26,26 +35,24 @@ describe('boxSlug', () => {
 });
 
 describe('buildBoxExtras — MCP', () => {
-  test('compiles mcp to <configDir>/mcp/<slug>.json and adds strict flags', () => {
+  test('compiles mcp to <claboxHome>/mcp/<slug>.json and adds strict flags', () => {
     const servers = { 'is-mg': { type: 'http' as const, url: 'https://x/mcp' } };
     const { claudeArgs, files } = buildBoxExtras(cfg({ mcp: servers }), 'is-mg');
 
-    expect(claudeArgs).toEqual([
-      '--strict-mcp-config',
-      '--mcp-config',
-      path.join('/cfg', 'mcp', 'is-mg.json'),
-    ]);
+    const mcpFile = path.join(claboxMcpDir(), 'is-mg.json');
+    expect(claudeArgs).toEqual(['--strict-mcp-config', '--mcp-config', mcpFile]);
     expect(files).toHaveLength(1);
-    expect(files[0].path).toBe(path.join('/cfg', 'mcp', 'is-mg.json'));
+    expect(files[0].path).toBe(mcpFile);
     expect(JSON.parse(files[0].content)).toEqual({ mcpServers: servers });
   });
 
-  test('expands ~ in configDir for the materialized path', () => {
+  test('materializes under clabox home regardless of the Claude configDir', () => {
     const { files } = buildBoxExtras(
       cfg({ configDir: '~/.claude_x', mcp: { a: { url: 'u' } } }),
       'b',
     );
-    expect(files[0].path).toBe(path.join(process.env.HOME ?? '', '.claude_x', 'mcp', 'b.json'));
+    // configDir is '~/.claude_x' but the file lands under ~/.config/clabox/mcp.
+    expect(files[0].path).toBe(path.join(claboxMcpDir(), 'b.json'));
   });
 
   test('no mcp flags or files when mcp is absent or empty', () => {
@@ -76,10 +83,10 @@ describe('buildBoxExtras — hooks', () => {
     Stop: [{ hooks: [{ type: 'command' as const, command: '/h/notify.sh' }] }],
   };
 
-  test('compiles hooks to <configDir>/settings/<slug>.json and adds --settings', () => {
+  test('compiles hooks to <claboxHome>/settings/<slug>.json and adds --settings', () => {
     // claudeArgs: [] → no inline --settings to merge, so the file is hooks-only.
     const { claudeArgs, files } = buildBoxExtras(cfg({ claudeArgs: [], hooks: stopHook }), 'is-mg');
-    const settingsFile = path.join('/cfg', 'settings', 'is-mg.json');
+    const settingsFile = path.join(claboxSettingsDir(), 'is-mg.json');
     expect(claudeArgs).toEqual(['--settings', settingsFile]);
     expect(files).toHaveLength(1);
     expect(files[0].path).toBe(settingsFile);
@@ -110,7 +117,7 @@ describe('buildBoxExtras — combined', () => {
     expect(claudeArgs).toEqual([
       '--strict-mcp-config',
       '--mcp-config',
-      path.join('/cfg', 'mcp', 'box.json'),
+      path.join(claboxMcpDir(), 'box.json'),
       '--append-system-prompt',
       'hi',
     ]);
@@ -125,11 +132,11 @@ describe('buildBoxExtras — combined', () => {
     expect(claudeArgs).toEqual([
       '--strict-mcp-config',
       '--mcp-config',
-      path.join('/cfg', 'mcp', 'box.json'),
+      path.join(claboxMcpDir(), 'box.json'),
       '--append-system-prompt',
       'hi',
       '--settings',
-      path.join('/cfg', 'settings', 'box.json'),
+      path.join(claboxSettingsDir(), 'box.json'),
     ]);
   });
 });

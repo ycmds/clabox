@@ -15,7 +15,7 @@ import {
   type InfoData,
   resolveClaboxPackage,
 } from '../src/info/info.js';
-import { type Config, defaultConfig } from '../src/utils/config.js';
+import { type Config, claboxMcpDir, defaultConfig } from '../src/utils/config.js';
 
 const repoRoot = path.resolve(fileURLToPath(import.meta.url), '../..');
 const pkgVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
@@ -71,9 +71,9 @@ describe('gatherInfo', () => {
     expect(d.hookEvents).toEqual(['Stop']);
     expect(d.env).toEqual(['GITHUB_TOKEN=xxx']);
     expect(d.paths.readWrite).toEqual(['~/w']);
-    // extras: mcp adds the strict flags + file under <configDir>/mcp/<slug>.json
+    // extras: mcp adds the strict flags + file under ~/.config/clabox/mcp/<slug>.json
     expect(d.extraArgs).toContain('--strict-mcp-config');
-    expect(d.extraFiles).toContain(path.join('/cfg', 'mcp', 'box.json'));
+    expect(d.extraFiles).toContain(path.join(claboxMcpDir(), 'box.json'));
   });
 
   test('hasSystemPrompt is false for a blank prompt', () => {

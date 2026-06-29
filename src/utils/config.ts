@@ -133,7 +133,8 @@ export interface Config {
   claudeArgs: string[];
   /**
    * Per-box MCP servers (the `mcpServers` map). clabox compiles them to
-   * `<configDir>/mcp/<slug>.json` and launches claude with
+   * `<claboxHome>/mcp/<slug>.json` (i.e. `~/.config/clabox/mcp/…`, NOT the
+   * Claude configDir) and launches claude with
    * `--strict-mcp-config --mcp-config <file>`, so a shared configDir's global /
    * plugin MCP servers are ignored — each box gets exactly these and no more.
    * Materialized on every `run` and during `init`. Absent → no MCP flags.
@@ -147,7 +148,8 @@ export interface Config {
   systemPrompt?: string | string[];
   /**
    * Per-box hooks (claude's settings.json `hooks` map). clabox merges them into
-   * a settings JSON written to `<configDir>/settings/<slug>.json` and launches
+   * a settings JSON written to `<claboxHome>/settings/<slug>.json` (i.e.
+   * `~/.config/clabox/settings/…`, NOT the Claude configDir) and launches
    * claude with `--settings <file>` — merging (not clobbering) any inline
    * `--settings` already in `claudeArgs`, so `includeCoAuthoredBy` survives.
    * Materialized on every `run` and during `init`. Absent → no settings flag.
@@ -255,6 +257,27 @@ export function findConfigFile(explicit?: string | null): string | null {
  */
 export function configsDir(): string {
   return expandHome(env.CLABOX_CONFIGS_DIR ?? '~/.config/clabox/configs');
+}
+
+/**
+ * Clabox's own home dir — the parent of {@link configsDir} (default
+ * `~/.config/clabox`, honoring `CLABOX_CONFIGS_DIR`). Holds clabox-owned
+ * generated artifacts (`scripts/`, `ghostty/`, `apps/`) and the per-box extras
+ * compiled by `buildBoxExtras` (`mcp/`, `settings/`). Deliberately kept OUT of
+ * Claude's `configDir` so clabox never pollutes Claude's own profile dir.
+ */
+export function claboxHomeDir(): string {
+  return path.dirname(configsDir());
+}
+
+/** `<claboxHome>/mcp` — per-box compiled `--mcp-config` json lives here. */
+export function claboxMcpDir(): string {
+  return path.join(claboxHomeDir(), 'mcp');
+}
+
+/** `<claboxHome>/settings` — per-box compiled `--settings` (hooks) json lives here. */
+export function claboxSettingsDir(): string {
+  return path.join(claboxHomeDir(), 'settings');
 }
 
 const BOX_SUFFIXES = ['.config.mjs', '.mjs'];

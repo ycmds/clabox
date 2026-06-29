@@ -131,9 +131,9 @@ export interface InitResult {
 }
 
 /**
- * Compile each box's declarative `mcp` (→ `<configDir>/mcp/<box>.json`) so the
- * files exist ahead of the first run (the same files `run` writes; slug = box
- * name). Best-effort per box: a config that fails to load becomes a warning.
+ * Compile each box's declarative `mcp` (→ `~/.config/clabox/mcp/<box>.json`) so
+ * the files exist ahead of the first run (the same files `run` writes; slug =
+ * box name). Best-effort per box: a config that fails to load becomes a warning.
  */
 async function materializeExtras(
   configsDir: string,

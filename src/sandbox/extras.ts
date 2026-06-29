@@ -4,7 +4,7 @@
 // scaffold.ts at `init`) do the actual fs writes.
 
 import path from 'node:path';
-import { type Config, expandHome } from '../utils/config.js';
+import { type Config, claboxMcpDir, claboxSettingsDir } from '../utils/config.js';
 
 /** A file to materialize before launching claude (absolute path + content). */
 export interface ExtraFile {
@@ -16,7 +16,7 @@ export interface ExtraFile {
 export interface BoxExtras {
   /** Appended after `config.claudeArgs`, before any CLI args. */
   claudeArgs: string[];
-  /** Files to write (under configDir, which the sandbox grants RW). */
+  /** Files to write (under clabox's home `~/.config/clabox`, granted RO in-box). */
   files: ExtraFile[];
 }
 
@@ -58,24 +58,28 @@ function readInlineSettings(claudeArgs: string[]): Record<string, unknown> {
 /**
  * Compile `config.mcp` / `config.systemPrompt` / `config.hooks` into claude args.
  *
- * - MCP: written to `<configDir>/mcp/<slug>.json` and loaded with
+ * All materialized files live under clabox's own home (`~/.config/clabox`, via
+ * {@link claboxMcpDir} / {@link claboxSettingsDir}) — NOT the Claude `configDir`,
+ * so clabox never pollutes Claude's profile dir. The sandbox profile re-grants
+ * READ to just those two subdirs (after its hard `.config` deny) so the box can
+ * read them; clabox writes them before launch, so no in-box write is needed.
+ *
+ * - MCP: written to `<claboxHome>/mcp/<slug>.json` and loaded with
  *   `--strict-mcp-config --mcp-config <file>` (global/plugin servers ignored).
- *   configDir is sandbox-RW, so the json is readable inside the box.
  * - systemPrompt: appended inline via `--append-system-prompt` (no file —
  *   nothing to leave stale; `string[]` is joined with blank lines).
  * - hooks: merged into the inline `--settings` (see {@link readInlineSettings})
- *   and written to `<configDir>/settings/<slug>.json`, loaded with
+ *   and written to `<claboxHome>/settings/<slug>.json`, loaded with
  *   `--settings <file>` — which, emitted after `config.claudeArgs`, wins the
  *   last-`--settings`-takes-all race while carrying the merged result.
  */
 export function buildBoxExtras(config: Config, slug: string): BoxExtras {
-  const configDir = expandHome(config.configDir);
   const claudeArgs: string[] = [];
   const files: ExtraFile[] = [];
 
   const servers = config.mcp;
   if (servers && Object.keys(servers).length > 0) {
-    const mcpFile = path.join(configDir, 'mcp', `${slug}.json`);
+    const mcpFile = path.join(claboxMcpDir(), `${slug}.json`);
     files.push({
       path: mcpFile,
       content: `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
@@ -89,7 +93,7 @@ export function buildBoxExtras(config: Config, slug: string): BoxExtras {
 
   const hooks = config.hooks;
   if (hooks && Object.keys(hooks).length > 0) {
-    const settingsFile = path.join(configDir, 'settings', `${slug}.json`);
+    const settingsFile = path.join(claboxSettingsDir(), `${slug}.json`);
     const merged = { ...readInlineSettings(config.claudeArgs), hooks };
     files.push({ path: settingsFile, content: `${JSON.stringify(merged, null, 2)}\n` });
     claudeArgs.push('--settings', settingsFile);
