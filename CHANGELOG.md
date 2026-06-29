@@ -1,3 +1,10 @@
+## [0.2.1](https://github.com/ycmds/clabox/compare/v0.2.0...v0.2.1) (2026-06-29)
+
+
+### Bug Fixes
+
+* clabox absolute path in ghossty ([e79f6e9](https://github.com/ycmds/clabox/commit/e79f6e982cf59a3f034ebf600e5280b12534f632))
+
 # [0.2.0](https://github.com/ycmds/clabox/compare/v0.1.1...v0.2.0) (2026-06-29)
 
 
