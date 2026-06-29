@@ -1,3 +1,10 @@
+# [0.2.0](https://github.com/ycmds/clabox/compare/v0.1.1...v0.2.0) (2026-06-29)
+
+
+### Features
+
+* stable version ([87b2d42](https://github.com/ycmds/clabox/commit/87b2d422f7aceaebed1375d0c321257504556600))
+
 ## [0.1.1](https://github.com/ycmds/clabox/compare/v0.1.0...v0.1.1) (2026-06-23)
 
 
