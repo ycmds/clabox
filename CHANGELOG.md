@@ -1,3 +1,11 @@
+# [0.3.0](https://github.com/ycmds/clabox/compare/v0.2.2...v0.3.0) (2026-06-29)
+
+
+### Features
+
+* add `info` command + per-box hooks ([605b332](https://github.com/ycmds/clabox/commit/605b3329b6b2f619d4bd4058a6d5a6afc5681bdd))
+* move per-box extras to clabox home + notification banners ([ed235a5](https://github.com/ycmds/clabox/commit/ed235a591651c91d8999b7375f30aedb6a2b74d3))
+
 ## [0.2.2](https://github.com/ycmds/clabox/compare/v0.2.1...v0.2.2) (2026-06-29)
 
 
