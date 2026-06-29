@@ -16,9 +16,18 @@ export interface GhosttyConfigOptions {
   boxName: string;
   /** Absolute project dir to `cd` into. null → don't `cd` (run in launch cwd). */
   projectDir: string | null;
-  /** Absolute `CLABOX_CONFIGS_DIR` so `-b` resolves the box from any cwd. */
-  configsDir: string;
-  /** Absolute path to the `clabox` binary. */
+  /**
+   * Absolute `CLABOX_CONFIGS_DIR` so `-b` resolves the box from any cwd, or
+   * null to omit it — when null, `-b` finds the box via the runtime default
+   * (`~/.config/clabox/configs`) at launch time.
+   */
+  configsDir: string | null;
+  /**
+   * The `clabox` command baked into the launcher. Default is a bare `clabox`
+   * resolved from PATH at launch time by the `zsh -lic` login shell (survives
+   * package-manager moves, e.g. bun → npm/homebrew); pass an absolute path only
+   * to pin a specific binary.
+   */
   claboxBin: string;
   /** Absolute path to a base Ghostty config, emitted as a leading `config-file`. */
   baseGhosttyConfig?: string | null;
@@ -27,7 +36,8 @@ export interface GhosttyConfigOptions {
 /** The `command = zsh -lic '…'` line that boots clabox for the box. */
 export function buildCommand(opts: GhosttyConfigOptions): string {
   const cd = opts.projectDir ? `cd ${opts.projectDir} && ` : '';
-  const inner = `${cd}CLABOX_CONFIGS_DIR=${opts.configsDir} ${opts.claboxBin} -b ${opts.boxName}; exec zsh`;
+  const env = opts.configsDir ? `CLABOX_CONFIGS_DIR=${opts.configsDir} ` : '';
+  const inner = `${cd}${env}${opts.claboxBin} -b ${opts.boxName}; exec zsh`;
   // Login + interactive zsh so the GUI-launched app inherits the user's PATH
   // (/etc/zprofile→path_helper for Homebrew, ~/.zshrc for fnm/nvm/volta). A bare
   // `bash -c` gets only launchd's minimal PATH and can't find `node` (clabox's

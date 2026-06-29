@@ -42,6 +42,13 @@ describe('alias text generation', () => {
     expect(idx).not.toContain('--dangerously-skip-permissions');
   });
 
+  test('index omits CLABOX_CONFIGS_DIR when the dir is the runtime default (null)', () => {
+    const idx = buildIndex(['ax'], { configsDir: null, scriptsDir: '/repo/__/scripts' });
+    expect(idx).not.toContain('CLABOX_CONFIGS_DIR');
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal shell, not a JS template
+    expect(idx).toContain('clabox -b "$1" "${@:2}"');
+  });
+
   test('wrapper sources index.sh and calls its function', () => {
     const w = buildWrapper('clabox-ax', '/repo/__/scripts/index.sh');
     expect(w).toContain('source "/repo/__/scripts/index.sh"');
@@ -155,6 +162,29 @@ describe('scaffold (real fs in a tmp dir)', () => {
     }
   });
 
+  test('an app box without claboxBin bakes a bare `clabox` (PATH-resolved at launch)', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-init-'));
+    const configs = path.join(base, 'configs');
+    fs.mkdirSync(configs);
+    fs.writeFileSync(
+      path.join(configs, 'mgr.mjs'),
+      `export default {
+        cwd: '/tmp/proj',
+        app: { name: 'Test Mgr' },
+        appBuilder: { ghosttyApp: '/no/such/Ghostty.app', appsDir: '/tmp/apps' },
+      }`,
+    );
+    try {
+      await runInit({ baseDir: base });
+      const txt = fs.readFileSync(path.join(base, 'ghostty', 'mgr.config'), 'utf8');
+      // bare `clabox`, not an absolute path — survives package-manager moves.
+      expect(txt).toContain(`CLABOX_CONFIGS_DIR=${configs} clabox -b mgr`);
+      expect(txt).not.toContain('.bun/bin/clabox');
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   test('--no-apps (buildApps:false) skips all Ghostty artifacts', async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-init-'));
     const configs = path.join(base, 'configs');
@@ -202,6 +232,22 @@ describe('ghostty config + launcher generation', () => {
     const cmd = buildCommand({ ...opts, projectDir: null });
     expect(cmd).not.toContain('cd ');
     expect(cmd).toContain('-b ax-mg');
+  });
+
+  test('buildCommand omits CLABOX_CONFIGS_DIR when configsDir is null', () => {
+    const cmd = buildCommand({ ...opts, configsDir: null });
+    expect(cmd).not.toContain('CLABOX_CONFIGS_DIR');
+    expect(cmd).toBe(
+      "command = zsh -lic 'cd /Users/me/projects/ax-mg && " +
+        "/Users/me/.bun/bin/clabox -b ax-mg; exec zsh'",
+    );
+  });
+
+  test('buildCommand uses a bare `clabox` (PATH-resolved) when given one', () => {
+    const cmd = buildCommand({ ...opts, configsDir: null, claboxBin: 'clabox' });
+    expect(cmd).toBe(
+      "command = zsh -lic 'cd /Users/me/projects/ax-mg && clabox -b ax-mg; exec zsh'",
+    );
   });
 
   test('buildGhosttyConfig emits title, macos-icon, extra lines and the command', () => {

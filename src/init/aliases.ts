@@ -19,8 +19,12 @@ export interface InitFile {
 
 /** Absolute locations for the generated artifacts. */
 export interface AliasPaths {
-  /** Dir holding the box config files. */
-  configsDir: string;
+  /**
+   * Dir holding the box config files, baked as `CLABOX_CONFIGS_DIR` so `-b`
+   * resolves boxes from any cwd, or null to omit it — when null, `-b` finds the
+   * box via the runtime default (`~/.config/clabox/configs`) at run time.
+   */
+  configsDir: string | null;
   /** Dir to emit `index.sh` and the per-box wrappers into. */
   scriptsDir: string;
 }
@@ -46,8 +50,11 @@ export function buildIndex(profiles: string[], { configsDir, scriptsDir }: Alias
     ...usage,
     '',
     '_clabox_run() {',
-    // Point `-b` at this dir so resolveBox picks the right .mjs/.config.mjs file.
-    `  CLABOX_CONFIGS_DIR="${configsDir}" clabox -b "$1" "\${@:2}"`,
+    // Point `-b` at this dir so resolveBox picks the right .mjs/.config.mjs file
+    // — unless it's the runtime default, then let `-b` resolve it at run time.
+    configsDir
+      ? `  CLABOX_CONFIGS_DIR="${configsDir}" clabox -b "$1" "\${@:2}"`
+      : `  clabox -b "$1" "\${@:2}"`,
     '}',
     '',
     ...defs,

@@ -3,7 +3,6 @@
 // in via `app` — generate a Ghostty config in `<base>/ghostty/` and build a
 // standalone `<appsDir>/<name>.app` (see init/app.ts).
 
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { buildBoxExtras } from '../sandbox/extras.js';
@@ -47,19 +46,36 @@ function pruneByExt(dir: string, ext: string): void {
   }
 }
 
-/** Locate the `clabox` binary to bake into the generated Ghostty `command`. */
+/**
+ * The `clabox` command baked into the generated Ghostty `command`. Default is a
+ * bare `clabox` resolved from PATH at launch time by the `zsh -lic` login shell
+ * — this survives package-manager moves (e.g. bun → npm/homebrew) that change
+ * the binary's absolute path. Only an explicit `appBuilder.claboxBin` pins an
+ * absolute path.
+ */
 function resolveClaboxBin(configured: string | null): string {
-  if (configured) return expandHome(configured);
+  return configured ? expandHome(configured) : 'clabox';
+}
+
+/**
+ * The `CLABOX_CONFIGS_DIR` value to bake into generated commands, or null to
+ * omit it. Omit when `<dir>` resolves (realpath, symlinks included) to the
+ * runtime default `~/.config/clabox/configs` — then `-b` finds the box via that
+ * default at launch time, so no path needs baking (and it stays correct if the
+ * dir later moves behind the same symlink). Otherwise bake the absolute path so
+ * `-b` resolves the box regardless of the launcher's cwd.
+ */
+function bakeConfigsDir(dir: string): string | null {
   try {
-    const found = execFileSync('command', ['-v', 'clabox'], {
-      shell: '/bin/sh',
-      encoding: 'utf8',
-    }).trim();
-    if (found) return found;
+    // The launched process has no CLABOX_CONFIGS_DIR set (we omit it), so its
+    // runtime default is always ~/.config/clabox/configs — compare against that.
+    if (fs.realpathSync(dir) === fs.realpathSync(expandHome('~/.config/clabox/configs'))) {
+      return null;
+    }
   } catch {
-    // fall through
+    // default dir missing/unresolvable → bake the explicit path.
   }
-  return 'clabox';
+  return dir;
 }
 
 /** Options for {@link runInit}. */
@@ -165,7 +181,7 @@ async function buildAppArtifacts(
         app,
         boxName: name,
         projectDir,
-        configsDir,
+        configsDir: bakeConfigsDir(configsDir),
         claboxBin: resolveClaboxBin(config.appBuilder.claboxBin),
         baseGhosttyConfig: baseGhostty,
       }),
@@ -207,7 +223,7 @@ export async function runInit({
   fs.mkdirSync(scriptsDir, { recursive: true });
   pruneGenerated(scriptsDir);
 
-  const files = buildAliasFiles(profiles, { configsDir, scriptsDir });
+  const files = buildAliasFiles(profiles, { configsDir: bakeConfigsDir(configsDir), scriptsDir });
   for (const f of files) {
     fs.writeFileSync(f.path, f.content);
     if (f.executable) fs.chmodSync(f.path, 0o755);
