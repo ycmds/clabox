@@ -1,3 +1,10 @@
+## [0.2.2](https://github.com/ycmds/clabox/compare/v0.2.1...v0.2.2) (2026-06-29)
+
+
+### Bug Fixes
+
+* default config dir ~/.config ([3883a1d](https://github.com/ycmds/clabox/commit/3883a1d3b0994c60e43912602c13b5dd2493f709))
+
 ## [0.2.1](https://github.com/ycmds/clabox/compare/v0.2.0...v0.2.1) (2026-06-29)
 
 
