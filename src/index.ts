@@ -37,6 +37,12 @@ export {
   runInit,
 } from './init/scaffold.js';
 export {
+  type BoxExtras,
+  boxSlug,
+  buildBoxExtras,
+  type ExtraFile,
+} from './sandbox/extras.js';
+export {
   buildProfile,
   detectPackagePaths,
   globalName,
@@ -67,6 +73,7 @@ export {
   type LoadedConfig,
   listBoxes,
   loadConfig,
+  type McpServer,
   mergeConfig,
   type PathRules,
   resolveBox,

@@ -36,7 +36,8 @@ src/
 ├── cli.ts                # CLI entry (yargs): run / generate / profile / init → lib/cli.js
 ├── sandbox/
 │   ├── profile.ts        # pure SBPL profile builder + package-manager autodetect
-│   └── run.ts            # I/O: locate claude/sandbox-exec, write profile, launch it
+│   ├── extras.ts         # pure: compile per-box `mcp`/`systemPrompt` → claude args + files
+│   └── run.ts            # I/O: locate claude/sandbox-exec, write profile + extras, launch it
 ├── init/
 │   ├── aliases.ts        # pure builder for the `clabox init` shell aliases (text only)
 │   ├── ghostty.ts        # pure builders: Ghostty config text + C launcher source + app paths
@@ -48,6 +49,7 @@ src/
 tests/
 ├── profile.test.ts       # bun:test — unit (profile text) + functional (real sandbox-exec)
 ├── init.test.ts          # bun:test — alias/ghostty text + scaffold & app boxes (tmp-dir fs)
+├── extras.test.ts        # bun:test — per-box mcp/systemPrompt → claude args + mcp json
 └── box.test.ts           # bun:test — named-box resolution (tmp-dir fs)
 clabox.config.example.mjs  # copyable user config
 ```
@@ -59,6 +61,7 @@ clabox.config.example.mjs  # copyable user config
 - The Seatbelt profile starts with `(deny default)` — nothing is allowed unless an explicit rule grants it
 - Config resolution, later wins: **defaults → env vars → JS config file** (`./clabox.config.mjs` or `~/.config/clabox/config.mjs`, or `CLABOX_CONFIG`, or the `--config` CLI flag which overrides `CLABOX_CONFIG`)
 - `config.cwd` (env `CLABOX_CWD`, `~`-expanded → absolute; default null → shell CWD) sets the dir `claude` runs in and the dir granted RW as the project. `resolveProjectDir(config)` in `sandbox/run.ts` computes it; `runClaude`/`generateProfile`/`profile` all key off it (and `spawnSync` runs with that `cwd`). Useful for named boxes that always target one project regardless of where `clabox` is invoked
+- **Per-box MCP & pre-prompt** (one shared `configDir`, separate MCP/system-prompt per box): user config stays pure data — `config.mcp` (a `Record<string, McpServer>`) and `config.systemPrompt` (`string | string[]`). `sandbox/extras.ts` is the pure builder: `buildBoxExtras(config, slug)` compiles `mcp` to `<configDir>/mcp/<slug>.json` and emits `--strict-mcp-config --mcp-config <file>` (so a shared configDir's *global/plugin* MCP servers are ignored — each box gets exactly its own), and appends `systemPrompt` inline via `--append-system-prompt` (no file). `slug` = `boxSlug(configFile, projectDir)` (config-file basename sans `.config.mjs`/`.mjs`, else project-dir basename). The json lives under `configDir` precisely because the sandbox grants it RW (and `~/.config/*` is hard-denied, so it can't live next to the box config). Materialized both at **run** (`run.ts#writeExtraFiles`, args spliced after `config.claudeArgs`, before CLI args) and at **init** (`scaffold.ts#materializeExtras`, slug = box name, best-effort per box). Arrays *replace* on merge, so presets can't pre-seed `mcp`; declare it on the box
 - **Named boxes** (`-b`/`--box <name>`): resolve `<name>` to a config file in the global configs dir (`~/.config/clabox/configs/<name>.config.mjs`, falling back to `<name>.mjs`; dir overridable via `CLABOX_CONFIGS_DIR`) and feed it to `loadConfig` as the explicit config — so `-b` is a global shortcut that wins over `--config`. `_`-prefixed files are shared partials (e.g. `_presets.mjs`), not boxes. `resolveBox`/`listBoxes`/`configsDir` live in `utils/config.ts`. (Distinct from `init`, which scans a project-local `__/configs` to emit shell aliases.)
 - Two deny tiers (SBPL = last matching rule wins, so order is load-bearing): a **soft** privacy deny (`denyHome` dirs + `paths.deny`) is emitted *before* the extra `readOnly`/`readWrite` and the project dir, so an explicit grant may override it (e.g. a project under `~/Documents`, or a broad `readOnly` for a debug box); a **hard** secret deny (`~/.ssh/id_*`, `*.pem`, `*.key`, `denyDotConfigs` credential dirs) is emitted as the **very last file rule**, after every allow, so it always wins — personal credentials are never readable however wide the grants. Only the bot key subdir (not matched by the patterns) stays readable
 - Profiles are deterministic per project: `$TMPDIR/clabox-<dir>-<hash>.sb` (sha256 of the absolute project path)

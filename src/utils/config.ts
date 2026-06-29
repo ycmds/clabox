@@ -69,6 +69,20 @@ export interface AppBuilderConfig {
   claboxBin: string | null;
 }
 
+/**
+ * A single MCP server entry — the value under a key in claude's `mcpServers`
+ * map. Loose on purpose (mirrors claude's mcp.json schema): `stdio` servers use
+ * `command`/`args`/`env`, remote `http`/`sse` servers use `url`/`headers`.
+ */
+export interface McpServer {
+  type?: 'stdio' | 'http' | 'sse';
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+}
+
 /** Extra rules layered on top of the built-in base profile. */
 export interface PathRules {
   /** RW subpaths (beyond project dir + configDir + /tmp). */
@@ -95,6 +109,20 @@ export interface Config {
   configDir: string;
   /** Extra args always passed to `claude`, before any args from the CLI. */
   claudeArgs: string[];
+  /**
+   * Per-box MCP servers (the `mcpServers` map). clabox compiles them to
+   * `<configDir>/mcp/<slug>.json` and launches claude with
+   * `--strict-mcp-config --mcp-config <file>`, so a shared configDir's global /
+   * plugin MCP servers are ignored — each box gets exactly these and no more.
+   * Materialized on every `run` and during `init`. Absent → no MCP flags.
+   */
+  mcp?: Record<string, McpServer>;
+  /**
+   * Text appended to claude's system prompt via `--append-system-prompt`.
+   * `string[]` is joined with blank lines. Use it for per-box pre-prompts while
+   * sharing one configDir (the user-level CLAUDE.md is shared; this is not).
+   */
+  systemPrompt?: string | string[];
   bot: BotConfig;
   /**
    * Extra environment variables forced onto the sandboxed `claude` process,

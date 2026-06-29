@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { type Config, expandHome, HOME } from '../utils/config.js';
+import { boxSlug, buildBoxExtras, type ExtraFile } from './extras.js';
 import { buildProfile, detectPackagePaths } from './profile.js';
 
 const TMPDIR = (process.env.TMPDIR || '/tmp').replace(/\/$/, '');
@@ -92,6 +93,21 @@ export function buildEnvArgs(config: Config): string[] {
   return args;
 }
 
+/**
+ * Write the per-box extra files (mkdir -p their dirs) `0600`. They live under
+ * configDir and can carry secrets (e.g. an MCP auth token in a URL/header), so
+ * they're kept out of argv (vs. an inline `--mcp-config '<json>'`) AND off the
+ * world-readable bit on disk. Returns the paths.
+ */
+export function writeExtraFiles(files: ExtraFile[]): string[] {
+  for (const f of files) {
+    fs.mkdirSync(path.dirname(f.path), { recursive: true });
+    fs.writeFileSync(f.path, f.content, { mode: 0o600 });
+    fs.chmodSync(f.path, 0o600); // enforce even if the file pre-existed
+  }
+  return files.map((f) => f.path);
+}
+
 /** Options accepted by {@link runClaude}. */
 export interface RunOptions {
   configFile?: string | null;
@@ -107,11 +123,17 @@ export function runClaude(
   const claudeBin = resolveClaudeBin(config);
   const profileFile = generateProfile(config, projectDir);
 
+  // Compile the box's declarative mcp / systemPrompt into claude args, and
+  // materialize the files they reference (under configDir, which is sandbox-RW).
+  const extras = buildBoxExtras(config, boxSlug(configFile, projectDir));
+  const extraFiles = writeExtraFiles(extras.files);
+
   if (process.env.CLABOX_DEBUG) {
     console.error(`→ Running Claude Code sandboxed in:  ${projectDir}`);
     console.error(`→ Profile: ${profileFile}`);
     console.error(`→ Config:  ${expandHome(config.configDir)}`);
     if (configFile) console.error(`→ Config file: ${configFile}`);
+    for (const f of extraFiles) console.error(`→ MCP:     ${f}`);
   }
 
   // Terminal title = cwd (with ~ for $HOME), matching the bash version.
@@ -128,6 +150,7 @@ export function runClaude(
     ...envArgs,
     claudeBin,
     ...defaultArgs,
+    ...extras.claudeArgs,
     ...claudeArgs,
   ];
 

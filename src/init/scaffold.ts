@@ -6,6 +6,7 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { buildBoxExtras } from '../sandbox/extras.js';
 import { type Config, expandHome, listBoxes, loadConfig, resolveBox } from '../utils/config.js';
 import { buildAliasFiles } from './aliases.js';
 import { buildApp, canBuildApps } from './app.js';
@@ -90,8 +91,36 @@ export interface InitResult {
   ghosttyConfigs: string[];
   /** Generated Raycast command scripts. */
   raycastCommands: string[];
+  /** Compiled per-box MCP json files (from `config.mcp`). */
+  extraFiles: string[];
   /** Non-fatal issues (e.g. app build skipped/failed). */
   warnings: string[];
+}
+
+/**
+ * Compile each box's declarative `mcp` (→ `<configDir>/mcp/<box>.json`) so the
+ * files exist ahead of the first run (the same files `run` writes; slug = box
+ * name). Best-effort per box: a config that fails to load becomes a warning.
+ */
+async function materializeExtras(
+  configsDir: string,
+  profiles: string[],
+  result: InitResult,
+): Promise<void> {
+  for (const name of profiles) {
+    try {
+      const { config } = await loadConfig(resolveBox(name, configsDir));
+      for (const f of buildBoxExtras(config, name).files) {
+        fs.mkdirSync(path.dirname(f.path), { recursive: true });
+        // 0600 — the MCP json can carry an auth token (see run.ts#writeExtraFiles).
+        fs.writeFileSync(f.path, f.content, { mode: 0o600 });
+        fs.chmodSync(f.path, 0o600);
+        result.extraFiles.push(f.path);
+      }
+    } catch (e) {
+      result.warnings.push(`${name}: extras not materialized — ${(e as Error).message}`);
+    }
+  }
 }
 
 /** Generate the Ghostty configs and build the apps for every `app` box. */
@@ -192,8 +221,11 @@ export async function runInit({
     apps: [],
     ghosttyConfigs: [],
     raycastCommands: [],
+    extraFiles: [],
     warnings: [],
   };
+
+  await materializeExtras(configsDir, profiles, result);
 
   if (buildApps) {
     await buildAppArtifacts(base, configsDir, profiles, only, result);

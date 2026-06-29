@@ -94,13 +94,15 @@ await yargs(hideBin(process.argv))
           describe: 'Build only this app box (by box name or app display name)',
         }),
     async (argv) => {
-      const { profiles, indexFile, written, apps, raycastCommands, warnings } = await runInit({
-        baseDir: argv.dir as string | undefined,
-        buildApps: argv.apps as boolean,
-        only: (argv.app as string | undefined) ?? null,
-      });
+      const { profiles, indexFile, written, apps, raycastCommands, extraFiles, warnings } =
+        await runInit({
+          baseDir: argv.dir as string | undefined,
+          buildApps: argv.apps as boolean,
+          only: (argv.app as string | undefined) ?? null,
+        });
       console.log(`clabox init: ${profiles.length} profile(s) → ${profiles.join(', ')}`);
       for (const f of written) console.log(`  ${path.basename(f)}`);
+      for (const f of extraFiles) console.log(`  🔌 ${f}`);
       for (const a of apps) console.log(`  📦 ${a.appPath} (${a.signed})`);
       for (const r of raycastCommands) console.log(`  🚀 ${r}`);
       for (const w of warnings) console.warn(`  ⚠️  ${w}`);
