@@ -119,3 +119,82 @@ describe('resolveBox', () => {
     }
   });
 });
+
+describe('resolveBox (path form)', () => {
+  test('resolves an explicit .mjs file path as-is', () => {
+    const dir = seedConfigs(['vibe.mjs']);
+    try {
+      const file = path.join(dir, 'vibe.mjs');
+      expect(resolveBox(file)).toBe(file);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resolves an explicit .config.mjs file path as-is', () => {
+    const dir = seedConfigs(['vibe.config.mjs']);
+    try {
+      const file = path.join(dir, 'vibe.config.mjs');
+      expect(resolveBox(file)).toBe(file);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resolves a relative file path against the CWD', () => {
+    const dir = seedConfigs(['vibe.mjs']);
+    try {
+      const file = path.join(dir, 'vibe.mjs');
+      const rel = path.relative(process.cwd(), file);
+      expect(rel).toContain(path.sep); // sanity: it really is the path form
+      expect(resolveBox(rel)).toBe(path.resolve(rel));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('dir-qualified name prefers .config.mjs and falls back to .mjs', () => {
+    const dir = seedConfigs(['ax.config.mjs', 'ax.mjs', 'vibe.mjs']);
+    try {
+      expect(resolveBox(path.join(dir, 'ax'))).toBe(path.join(dir, 'ax.config.mjs'));
+      expect(resolveBox(path.join(dir, 'vibe'))).toBe(path.join(dir, 'vibe.mjs'));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('throws for a missing explicit file path', () => {
+    expect(() => resolveBox('/no/such/dir/vibe.mjs')).toThrow(/box config .* not found/);
+  });
+
+  test('a directory is not mistaken for a config file', () => {
+    const dir = seedConfigs([]);
+    try {
+      fs.mkdirSync(path.join(dir, 'vibe.mjs'));
+      expect(() => resolveBox(path.join(dir, 'vibe.mjs'))).toThrow(/not found/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('dir-qualified missing name lists the boxes available in that dir', () => {
+    const dir = seedConfigs(['ax.config.mjs']);
+    try {
+      expect(() => resolveBox(path.join(dir, 'nope'))).toThrow(/available: ax/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('refuses a dir-qualified _partial, but an explicit _*.mjs path works', () => {
+    const dir = seedConfigs(['_presets.mjs']);
+    try {
+      // by name it's a partial…
+      expect(() => resolveBox(path.join(dir, '_presets'))).toThrow(/not found/);
+      // …but pointing at the file itself is explicit intent (like --config)
+      expect(resolveBox(path.join(dir, '_presets.mjs'))).toBe(path.join(dir, '_presets.mjs'));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

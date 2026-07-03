@@ -36,12 +36,13 @@ await yargs(hideBin(process.argv))
     type: 'string',
     describe: 'Path to a JS config file (overrides CLABOX_CONFIG)',
   })
-  // clabox-owned flag: run a named config from the global configs dir.
+  // clabox-owned flag: run a named config from the global configs dir,
+  // or straight from a config-file path (`-b path/vibe.mjs`, `-b path/vibe`).
   // (`-p` is left for claude's --print; `-c/-r/-d/-v` are claude flags too.)
   .option('box', {
     alias: 'b',
     type: 'string',
-    describe: 'Run a named config from ~/.config/clabox/configs/<name>.config.mjs',
+    describe: 'Box name from ~/.config/clabox/configs, or a path to a box config',
   })
   .command(
     ['run [claudeArgs..]', '$0 [claudeArgs..]'],
@@ -132,6 +133,7 @@ await yargs(hideBin(process.argv))
   )
   .example('$0 run --dangerously-skip-permissions', 'YOLO mode inside the sandbox')
   .example('$0 -b ax-root', 'Run the ~/.config/clabox/configs/ax-root.config.mjs box')
+  .example('$0 -b ./boxes/vibe.mjs', 'Run a box straight from a config-file path')
   .example('$0 info', 'Print version/box/config diagnostics for the resolved config')
   .example('$0 init', 'Generate shell aliases from ~/.config/clabox/configs/*.config.mjs')
   .example('$0 --config ./my.clabox.mjs run', 'Use a specific JS config file')
@@ -143,6 +145,8 @@ await yargs(hideBin(process.argv))
       '(or --config /path, or CLABOX_CONFIG=/path).',
       'Named boxes: -b <name> -> ~/.config/clabox/configs/<name>.config.mjs',
       '(dir overridable via CLABOX_CONFIGS_DIR).',
+      'Path boxes: -b path/vibe.mjs (explicit file) or -b path/vibe',
+      '(box `vibe` resolved inside path/).',
     ].join('\n'),
   )
   .version(false)

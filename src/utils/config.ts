@@ -287,6 +287,15 @@ function boxCandidates(name: string, dir: string): string[] {
   return BOX_SUFFIXES.map((s) => path.join(dir, `${name}${s}`));
 }
 
+/** True if `p` exists and is a regular file (not a directory). */
+function isFile(p: string): boolean {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** Named box configs (sorted, de-duplicated) available in {@link configsDir}. */
 export function listBoxes(dir: string = configsDir()): string[] {
   let entries: string[];
@@ -306,21 +315,39 @@ export function listBoxes(dir: string = configsDir()): string[] {
 }
 
 /**
- * Resolve a box name to its config file in {@link configsDir}, preferring
- * `<name>.config.mjs` over a bare `<name>.mjs`.
+ * Resolve a `-b`/`--box` ref to its config file. Three forms:
+ *
+ *  - `<name>` — a named box in {@link configsDir} (or `dir`), preferring
+ *    `<name>.config.mjs` over a bare `<name>.mjs`;
+ *  - `path/to/<name>` — the same name lookup, but inside that directory
+ *    (`~`-expanded, relative to the CWD), so a repo can carry its own boxes;
+ *  - `path/to/file.mjs` — an explicit config file, used as-is.
  *
  * @throws if no matching file exists (the message lists the available boxes).
  */
-export function resolveBox(name: string, dir: string = configsDir()): string {
+export function resolveBox(ref: string, dir: string = configsDir()): string {
+  const expanded = expandHome(ref);
+  // Explicit file path: `-b path/vibe.mjs` (covers `.config.mjs` too).
+  if (expanded.endsWith('.mjs')) {
+    const file = path.resolve(expanded);
+    if (isFile(file)) return file;
+    throw new Error(`clabox: box config '${ref}' not found (${file})`);
+  }
+  // Directory-qualified name: `-b path/to/vibe` = box `vibe` inside `path/to`
+  // — same suffix preference and `_`-partial refusal as a named box.
+  if (expanded.includes(path.sep)) {
+    const p = path.resolve(expanded);
+    return resolveBox(path.basename(p), path.dirname(p));
+  }
   // `_`-prefixed files are shared partials (e.g. `_presets.mjs`), not boxes —
   // keep them un-resolvable so `-b` matches what `listBoxes` advertises.
-  if (!name.startsWith('_')) {
-    const found = boxCandidates(name, dir).find((c) => fs.existsSync(c));
+  if (!ref.startsWith('_')) {
+    const found = boxCandidates(ref, dir).find((c) => isFile(c));
     if (found) return found;
   }
   const available = listBoxes(dir);
   const hint = available.length ? `available: ${available.join(', ')}` : `none found in ${dir}`;
-  throw new Error(`clabox: box '${name}' not found in ${dir} (${hint})`);
+  throw new Error(`clabox: box '${ref}' not found in ${dir} (${hint})`);
 }
 
 /** Result of {@link loadConfig}: the effective config and the file it came from. */

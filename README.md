@@ -103,6 +103,13 @@ to a bare `<name>.mjs`) and loads it like `--config` — so it wins over `--conf
 / `CLABOX_CONFIG`. Override the dir with `CLABOX_CONFIGS_DIR`. Files named
 `_*.mjs` are treated as shared partials (e.g. `_presets.mjs`), not boxes.
 
+`-b` also accepts a path, so a repo can carry its own box configs:
+
+```bash
+clabox -b ./boxes/vibe.mjs   # an explicit config file (any ref ending in .mjs)
+clabox -b ./boxes/vibe       # box `vibe` inside ./boxes (same .config.mjs/.mjs lookup)
+```
+
 A box can pin its own `cwd` so it always targets one project, no matter where you
 run `clabox` from:
 
