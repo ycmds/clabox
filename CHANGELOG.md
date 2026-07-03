@@ -1,3 +1,11 @@
+# [0.4.0](https://github.com/ycmds/clabox/compare/v0.3.0...v0.4.0) (2026-07-03)
+
+
+### Features
+
+* enhance box resolution to support explicit file paths and directory-qualified names ([ecce6d6](https://github.com/ycmds/clabox/commit/ecce6d6140c0bd0ce608c230c6e22ef74436329e))
+* grant process introspection permissions for better process visibility ([7c69b68](https://github.com/ycmds/clabox/commit/7c69b687bdbc2020fd5f4842ee63430f89baad3e))
+
 # [0.3.0](https://github.com/ycmds/clabox/compare/v0.2.2...v0.3.0) (2026-06-29)
 
 
