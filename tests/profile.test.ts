@@ -46,6 +46,10 @@ describe('profile text generation', () => {
     expect(p).toMatch(/^\(deny default\)$/m);
   });
 
+  test('process introspection is granted so ps/top/pgrep see all processes', () => {
+    expect(build()).toContain('(allow process-info*)');
+  });
+
   test('project dir is granted read-write + exec', () => {
     const p = build();
     expect(p).toContain(`(subpath "${PROJECT}")`);

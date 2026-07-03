@@ -94,7 +94,15 @@ export function buildProfile(
     ].join('\n'),
   );
 
-  add('introspection & sysctl', '(allow file-read-metadata)\n(allow sysctl-read)');
+  // `process-info*` lets tools like `ps`/`top`/`pgrep`/`lsof` enumerate other
+  // processes (libproc: proc_listallpids/proc_pidinfo) — without it `(deny
+  // default)` trims `ps` down to the sandboxed process itself. This leaks no
+  // more than the already-unconditional `sysctl-read`, which hands out every
+  // process's argv via KERN_PROCARGS2, so it lives here in introspection too.
+  add(
+    'introspection & sysctl',
+    '(allow file-read-metadata)\n(allow sysctl-read)\n(allow process-info*)',
+  );
 
   add(
     'basic dir traversal',
