@@ -1,3 +1,10 @@
+# [0.5.0](https://github.com/ycmds/clabox/compare/v0.4.0...v0.5.0) (2026-07-20)
+
+
+### Features
+
+* add read-only dirs in cli ([5e72f33](https://github.com/ycmds/clabox/commit/5e72f33be366ee492ed6a7924ff515674f886704))
+
 # [0.4.0](https://github.com/ycmds/clabox/compare/v0.3.0...v0.4.0) (2026-07-03)
 
 
