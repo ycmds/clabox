@@ -237,6 +237,30 @@ export function mergeConfig(base: Config, override: unknown): Config {
 }
 
 /**
+ * Append extra path grants (e.g. from the `--ro`/`--rw` CLI flags) onto a
+ * config's `paths`. Unlike a config-file merge — where arrays *replace* — these
+ * are **additive**: they concatenate onto `config.paths.readOnly`/`readWrite`,
+ * so an ad-hoc CLI grant never wipes out a box's own paths. Returns the same
+ * config unchanged when nothing extra is supplied.
+ */
+export function withExtraPaths(
+  config: Config,
+  extra: { readOnly?: string[]; readWrite?: string[] } = {},
+): Config {
+  const readOnly = extra.readOnly ?? [];
+  const readWrite = extra.readWrite ?? [];
+  if (!readOnly.length && !readWrite.length) return config;
+  return {
+    ...config,
+    paths: {
+      ...config.paths,
+      readOnly: [...config.paths.readOnly, ...readOnly],
+      readWrite: [...config.paths.readWrite, ...readWrite],
+    },
+  };
+}
+
+/**
  * Locate a config file: explicit (CLI arg, then `CLABOX_CONFIG` env),
  * then CWD, then ~/.config. The CLI arg wins over the env var.
  */

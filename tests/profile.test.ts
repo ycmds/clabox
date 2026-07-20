@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildProfile } from '../src/sandbox/profile.js';
 import { buildEnvArgs, resolveProjectDir } from '../src/sandbox/run.js';
-import { defaultConfig, findConfigFile, mergeConfig } from '../src/utils/config.js';
+import { defaultConfig, findConfigFile, mergeConfig, withExtraPaths } from '../src/utils/config.js';
 
 const PROJECT = '/tmp/sample-project';
 const build = (over: Record<string, unknown> = {}) =>
@@ -150,6 +150,40 @@ describe('profile text generation', () => {
       expect(p).toContain(`(subpath "${realHome}")`);
       expect(p.indexOf(`(subpath "${realHome}")`)).toBeGreaterThan(hardIdx);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unit: ad-hoc CLI path grants (`--ro`/`--rw` → withExtraPaths)
+// ---------------------------------------------------------------------------
+
+describe('withExtraPaths (CLI --ro/--rw)', () => {
+  test('nothing supplied returns the same config untouched', () => {
+    expect(withExtraPaths(defaultConfig)).toBe(defaultConfig);
+    expect(withExtraPaths(defaultConfig, { readOnly: [], readWrite: [] })).toBe(defaultConfig);
+  });
+
+  test('extra paths concatenate onto the box paths (additive, not replace)', () => {
+    const box = mergeConfig(defaultConfig, {
+      paths: { readWrite: ['/box/rw'], readOnly: ['/box/ro'], exec: ['/box/x'], deny: ['/box/no'] },
+    });
+    const merged = withExtraPaths(box, { readOnly: ['/cli/ro'], readWrite: ['/cli/rw'] });
+    // box grants survive…
+    expect(merged.paths.readOnly).toEqual(['/box/ro', '/cli/ro']);
+    expect(merged.paths.readWrite).toEqual(['/box/rw', '/cli/rw']);
+    // …and exec/deny are carried through unchanged
+    expect(merged.paths.exec).toEqual(['/box/x']);
+    expect(merged.paths.deny).toEqual(['/box/no']);
+  });
+
+  test('the extra paths land in the generated profile', () => {
+    const cfg = withExtraPaths(defaultConfig, {
+      readOnly: ['/tmp/cli-ro'],
+      readWrite: ['/tmp/cli-rw'],
+    });
+    const p = buildProfile(cfg, { projectDir: PROJECT, detectedPaths: [] });
+    expect(p).toContain('(subpath "/tmp/cli-ro")');
+    expect(p).toContain('(subpath "/tmp/cli-rw")');
   });
 });
 

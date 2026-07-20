@@ -12,7 +12,7 @@ import { hideBin } from 'yargs/helpers';
 import { formatInfo, gatherInfo } from './info/info.js';
 import { runInit } from './init/scaffold.js';
 import { generateProfile, profilePath, resolveProjectDir, runClaude } from './sandbox/run.js';
-import { loadConfig, resolveBox } from './utils/config.js';
+import { type Config, loadConfig, resolveBox, withExtraPaths } from './utils/config.js';
 
 /** Pick the explicit config path: a `--box <name>` wins over `--config <path>`. */
 // Index signature so any yargs argv (incl. commands with an empty builder)
@@ -24,6 +24,14 @@ function explicitConfig(argv: {
 }): string | undefined {
   if (argv.box) return resolveBox(argv.box as string);
   return (argv.config as string | undefined) ?? undefined;
+}
+
+/** Layer the ad-hoc `--ro`/`--rw` CLI grants onto the loaded config (additive). */
+function withCliPaths(config: Config, argv: { ro?: unknown; rw?: unknown }): Config {
+  return withExtraPaths(config, {
+    readOnly: (argv.ro as string[] | undefined) ?? [],
+    readWrite: (argv.rw as string[] | undefined) ?? [],
+  });
 }
 
 await yargs(hideBin(process.argv))
@@ -44,6 +52,21 @@ await yargs(hideBin(process.argv))
     type: 'string',
     describe: 'Box name from ~/.config/clabox/configs, or a path to a box config',
   })
+  // Ad-hoc sandbox path grants, additive over the config's `paths` (repeatable).
+  // `nargs: 1` keeps each flag greedy for exactly one value, so it never swallows
+  // the `run`/`generate`/… command or a trailing claude arg.
+  .option('ro', {
+    type: 'string',
+    array: true,
+    nargs: 1,
+    describe: 'Extra read-only path granted to the sandbox (repeatable)',
+  })
+  .option('rw', {
+    type: 'string',
+    array: true,
+    nargs: 1,
+    describe: 'Extra read-write path granted to the sandbox (repeatable)',
+  })
   .command(
     ['run [claudeArgs..]', '$0 [claudeArgs..]'],
     'Generate the profile and run claude inside the sandbox (default)',
@@ -56,7 +79,7 @@ await yargs(hideBin(process.argv))
     async (argv) => {
       const { config, configFile } = await loadConfig(explicitConfig(argv));
       const claudeArgs = (argv.claudeArgs ?? []) as string[];
-      const code = runClaude(config, claudeArgs, { configFile });
+      const code = runClaude(withCliPaths(config, argv), claudeArgs, { configFile });
       process.exit(code);
     },
   )
@@ -66,7 +89,7 @@ await yargs(hideBin(process.argv))
     (y) => y,
     async (argv) => {
       const { config } = await loadConfig(explicitConfig(argv));
-      console.log(generateProfile(config));
+      console.log(generateProfile(withCliPaths(config, argv)));
     },
   )
   .command(
@@ -75,7 +98,7 @@ await yargs(hideBin(process.argv))
     (y) => y,
     async (argv) => {
       const { config } = await loadConfig(explicitConfig(argv));
-      console.log(profilePath(resolveProjectDir(config)));
+      console.log(profilePath(resolveProjectDir(withCliPaths(config, argv))));
     },
   )
   .command(
@@ -84,7 +107,10 @@ await yargs(hideBin(process.argv))
     (y) => y,
     async (argv) => {
       const { config, configFile } = await loadConfig(explicitConfig(argv));
-      const data = gatherInfo(config, { configFile, box: argv.box as string | undefined });
+      const data = gatherInfo(withCliPaths(config, argv), {
+        configFile,
+        box: argv.box as string | undefined,
+      });
       const log = createLogger('clabox');
       // `.log` is the raw passthrough — keeps the aligned table intact (vs. the
       // per-line `ℹ clabox` prefix of `.info`); colorize only for a real TTY.
@@ -132,6 +158,8 @@ await yargs(hideBin(process.argv))
     },
   )
   .example('$0 run --dangerously-skip-permissions', 'YOLO mode inside the sandbox')
+  .example('$0 --ro ~/dir2 run', 'Grant the sandbox read-only access to ~/dir2')
+  .example('$0 --ro ~/a --rw ~/b run', 'Extra RO + RW grants (both flags repeatable)')
   .example('$0 -b ax-root', 'Run the ~/.config/clabox/configs/ax-root.config.mjs box')
   .example('$0 -b ./boxes/vibe.mjs', 'Run a box straight from a config-file path')
   .example('$0 info', 'Print version/box/config diagnostics for the resolved config')
