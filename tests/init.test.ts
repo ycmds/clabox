@@ -166,8 +166,8 @@ describe('scaffold (real fs in a tmp dir)', () => {
       const txt = fs.readFileSync(cfg, 'utf8');
       expect(txt).toContain('title = "T"');
       expect(txt).toContain('background = #000000');
-      expect(txt).toContain('cd /tmp/proj && ');
-      expect(txt).toContain(`CLABOX_CONFIGS_DIR=${configs} /usr/bin/clabox -b mgr`);
+      expect(txt).toContain('cd "/tmp/proj" && ');
+      expect(txt).toContain(`CLABOX_CONFIGS_DIR="${configs}" "/usr/bin/clabox" -b mgr`);
       // plain box has no app → no ghostty config
       expect(fs.existsSync(path.join(base, 'ghostty', 'plain.config'))).toBe(false);
       // a Raycast command that opens the (to-be) built app is written too
@@ -202,7 +202,7 @@ describe('scaffold (real fs in a tmp dir)', () => {
       await runInit({ baseDir: base });
       const txt = fs.readFileSync(path.join(base, 'ghostty', 'mgr.config'), 'utf8');
       // bare `clabox`, not an absolute path — survives package-manager moves.
-      expect(txt).toContain(`CLABOX_CONFIGS_DIR=${configs} clabox -b mgr`);
+      expect(txt).toContain(`CLABOX_CONFIGS_DIR="${configs}" "clabox" -b mgr`);
       expect(txt).not.toContain('.bun/bin/clabox');
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
@@ -247,8 +247,20 @@ describe('ghostty config + launcher generation', () => {
 
   test('buildCommand cds into the project and runs clabox -b <box>', () => {
     expect(buildCommand(opts)).toBe(
-      "command = zsh -lic 'cd /Users/me/projects/ax-mg && " +
-        "CLABOX_CONFIGS_DIR=/Users/me/.config/clabox/configs /Users/me/.bun/bin/clabox -b ax-mg; exec zsh'",
+      `command = zsh -lic 'cd "/Users/me/projects/ax-mg" && ` +
+        `CLABOX_CONFIGS_DIR="/Users/me/.config/clabox/configs" "/Users/me/.bun/bin/clabox" -b ax-mg; exec zsh'`,
+    );
+  });
+
+  test('buildCommand quotes a project dir with spaces (iCloud path)', () => {
+    const cmd = buildCommand({
+      ...opts,
+      projectDir: '/Users/me/Library/Mobile Documents/proj',
+      configsDir: null,
+      claboxBin: 'clabox',
+    });
+    expect(cmd).toBe(
+      `command = zsh -lic 'cd "/Users/me/Library/Mobile Documents/proj" && "clabox" -b ax-mg; exec zsh'`,
     );
   });
 
@@ -262,15 +274,15 @@ describe('ghostty config + launcher generation', () => {
     const cmd = buildCommand({ ...opts, configsDir: null });
     expect(cmd).not.toContain('CLABOX_CONFIGS_DIR');
     expect(cmd).toBe(
-      "command = zsh -lic 'cd /Users/me/projects/ax-mg && " +
-        "/Users/me/.bun/bin/clabox -b ax-mg; exec zsh'",
+      `command = zsh -lic 'cd "/Users/me/projects/ax-mg" && ` +
+        `"/Users/me/.bun/bin/clabox" -b ax-mg; exec zsh'`,
     );
   });
 
   test('buildCommand uses a bare `clabox` (PATH-resolved) when given one', () => {
     const cmd = buildCommand({ ...opts, configsDir: null, claboxBin: 'clabox' });
     expect(cmd).toBe(
-      "command = zsh -lic 'cd /Users/me/projects/ax-mg && clabox -b ax-mg; exec zsh'",
+      `command = zsh -lic 'cd "/Users/me/projects/ax-mg" && "clabox" -b ax-mg; exec zsh'`,
     );
   });
 

@@ -23,6 +23,37 @@ export const ipcName = (n: string): string => `(ipc-posix-name ${q(n)})`;
 /** Escape a path for safe embedding inside an SBPL regex. */
 export const reEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/**
+ * Compile one gitignore-style glob into an SBPL regex *body* — the part that
+ * matches a single path component (and, via the caller's trailing slash-or-end
+ * group, whatever lives under it). Depth is the caller's job: a leading
+ * double-star-slash or a leading slash is stripped here since every sandboxed
+ * path is absolute (a basename always follows a slash), so the caller anchors
+ * it under a root at any depth.
+ *
+ * `*` → a run of non-slash chars, `**` → any run (slashes included), `?` → one
+ * non-slash char; every other regex metachar is backslash-escaped. Pure, so it
+ * unit-tests without a profile. The `!`-negation (allow-vs-deny) is decided by
+ * the caller, not here.
+ */
+export function globToRegexBody(glob: string): string {
+  const g = glob.replace(/^\*\*\//, '').replace(/^\//, '');
+  let body = '';
+  for (let i = 0; i < g.length; ) {
+    if (g[i] === '*' && g[i + 1] === '*') {
+      body += '.*';
+      i += 2;
+      if (g[i] === '/') i += 1; // '**/' — the slash is folded into '.*'
+    } else {
+      const c = g[i++];
+      if (c === '*') body += '[^/]*';
+      else if (c === '?') body += '[^/]';
+      else body += /[A-Za-z0-9_/]/.test(c) ? c : `\\${c}`;
+    }
+  }
+  return body;
+}
+
 function block(op: string, rules: string[]): string {
   return [`(${op}`, ...rules.map((r) => `  ${r}`), ')'].join('\n');
 }
@@ -193,10 +224,16 @@ export function buildProfile(
     allow('file-read*', subpath('/private/var/db/timezone'), subpath('/Library/Preferences')),
   );
 
+  // `/dev/random` + `/dev/urandom` are the entropy source language runtimes read
+  // at startup — CPython seeds hash randomization from `/dev/urandom` and fatals
+  // (`_Py_HashRandomization_Init: failed to get random numbers`) if it's denied;
+  // Node's `crypto`, openssl and git need it too. Read-only: writing to the pool
+  // is never needed and adding entropy is not a capability the sandbox should grant.
   add(
     '/dev access (RO) + ioctl',
     [
       allow('file-read*', literal('/dev')),
+      allow('file-read*', literal('/dev/random'), literal('/dev/urandom')),
       allow('file-read* file-write*', regex('^/dev/(tty.*|null|zero|dtracehelper)')),
       allow('file-ioctl', literal('/dev/dtracehelper'), regex('^/dev/tty.*')),
     ].join('\n'),
@@ -349,6 +386,25 @@ export function buildProfile(
     ].join('\n'),
   );
 
+  // Glob read-DENY (gitignore-flavored): deny READ of files/dirs whose path —
+  // at any depth *inside the project* — matches a pattern (`.env`, dunder cruft,
+  // …). Emitted AFTER the project grant so it actually bites inside the project,
+  // but BEFORE the hard secret deny so that stays supreme. Deliberately scoped
+  // to the project: a global match would also shadow system runtimes granted
+  // earlier (e.g. `**/__*` vs CPython's `.../__init__.py`) and break them.
+  // `!`-prefixed patterns re-allow — last-match-wins mirrors `.gitignore`, so
+  // the order in `denyGlobs` is load-bearing. Patterns are data (config); this
+  // is just the compiler.
+  if (config.paths.denyGlobs.length) {
+    const projRe = reEscape(projectDir);
+    const rules = config.paths.denyGlobs.map((g) => {
+      const neg = g.startsWith('!');
+      const re = regex(`^${projRe}/(.*/)?${globToRegexBody(neg ? g.slice(1) : g)}(/|$)`);
+      return neg ? allow('file-read*', re) : deny('file-read*', re);
+    });
+    add('glob read-deny in project (gitignore-style — `.env`, dunder, …)', rules.join('\n'));
+  }
+
   // Hard secret DENY — emitted LAST of all file rules so it wins even over a
   // broad readOnly/readWrite or the project dir (SBPL = last matching rule
   // wins). This is the binding invariant: personal credentials and private keys
@@ -372,11 +428,18 @@ export function buildProfile(
   // compiled extras (mcp/settings json). The hard `.config` deny above blocks
   // the whole tree, and a user `paths.readWrite` CANNOT help: the hard deny is
   // emitted LAST and, SBPL being last-match-wins, always beats an earlier grant.
-  // Re-grant READ+WRITE to the clabox home AFTER the hard deny so a box can read
-  // its own `--mcp-config` / `--settings` and edit its own configs in-box. This
-  // is scoped to the `clabox` subdir only — the rest of ~/.config (aws, gnupg,
-  // docker, …) stays denied — and nothing credential-shaped lives here (secrets
-  // come from env, not files), so the hard-deny invariant still holds.
+  // Re-grant READ-ONLY to the clabox home AFTER the hard deny so a box can read
+  // its own `--mcp-config` / `--settings`. This is scoped to the `clabox` subdir
+  // only — the rest of ~/.config (aws, gnupg, docker, …) stays denied — and
+  // nothing credential-shaped lives here (secrets come from env, not files), so
+  // the hard-deny invariant still holds.
+  //
+  // Deliberately NOT writable: the box configs ARE the sandbox policy, so a
+  // write grant would let the sandboxed agent widen its own `paths`/`denyGlobs`
+  // for the next run. clabox itself writes the compiled mcp/settings json from
+  // OUTSIDE the sandbox (run.ts#writeExtraFiles, before claude starts), so
+  // in-box write is never needed to run a box — only to self-edit, which is
+  // exactly what we're taking away. Edit box configs from an unsandboxed shell.
   //
   // Seatbelt matches rules against the *real* (symlink-resolved) path of a vnode
   // — that's why this profile grants both `/tmp` and `/private/tmp`. When
@@ -386,9 +449,9 @@ export function buildProfile(
   // fails with EPERM. Grant the resolved target too.
   const claboxDirs = [claboxHomeDir(), ...resolvedClaboxHome()];
   add(
-    'clabox home (box configs + compiled mcp/settings) RW — re-granted after the hard deny',
+    'clabox home (box configs + compiled mcp/settings) READ-ONLY — re-granted after the hard deny',
     [
-      allow('file-read* file-write*', ...claboxDirs.map(subpath)),
+      allow('file-read*', ...claboxDirs.map(subpath)),
       // …plus exec, so a box's hook scripts can live in ~/.config/clabox (e.g.
       // a notify.sh) and actually run in-box without a separate `paths.exec`.
       allow('process-exec', ...claboxDirs.map(subpath)),

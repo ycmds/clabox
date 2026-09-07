@@ -54,7 +54,14 @@ export default {
     readWrite: [], // e.g. ['~/scratch', '/Volumes/work']
     readOnly: [], // e.g. ['~/reference-data', '~/some/hooks']
     exec: [], // e.g. ['/opt/some/tool/bin', '~/some/hooks'] (so hooks can run)
-    deny: [], // e.g. ['~/secret-project']
+    deny: [], // e.g. ['~/secret-project'] (subpath deny, read + write)
+
+    // gitignore-style READ-deny, matched at any depth INSIDE the project dir.
+    // `!` re-allows and last match wins, exactly like .gitignore, so order
+    // matters. Scoped to the project on purpose (a global match could also
+    // shadow system runtimes granted earlier and break them). Empty by default;
+    // e.g. hide every `.env*` secret but keep the `.env.example` template.
+    denyGlobs: [], // e.g. ['**/.env*', '!**/.env.example', '**/___*']
   },
 
   // Home subdirectories denied entirely (read + write).

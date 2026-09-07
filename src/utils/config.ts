@@ -115,6 +115,16 @@ export interface PathRules {
   exec: string[];
   /** explicit deny subpaths (read + write). */
   deny: string[];
+  /**
+   * gitignore-style globs whose matches are denied **read**, at any depth
+   * *inside the project workspace* (kept off system dirs on purpose — a global
+   * `**​/__*` would also shadow CPython's `.../__init__.py` and break it). A
+   * `!`-prefixed pattern re-allows; last match wins, exactly like `.gitignore`,
+   * so order matters. `*` = a run of non-slash chars, `**` = any run, `?` = one
+   * non-slash char; a directory match also covers its contents. Compiled to
+   * SBPL regex by `globToRegexBody` — the patterns live here as data.
+   */
+  denyGlobs: string[];
 }
 
 /** Effective clabox configuration. */
@@ -199,6 +209,10 @@ export const defaultConfig: Config = {
     readOnly: [],
     exec: [],
     deny: [],
+    // gitignore-style read-deny inside the project (opt-in, empty by default).
+    // e.g. ['**/.env*', '!**/.env.example', '**/___*'] to hide `.env*` secrets
+    // + `___*` files (triple `_` dodges Python dunders like `__init__.py`).
+    denyGlobs: [],
   },
   denyHome: ['Documents', 'Desktop', 'Downloads', 'Pictures', 'Movies', 'Music'],
   // `.config/git` is always carved back out for git RO config in the profile.

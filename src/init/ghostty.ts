@@ -33,11 +33,21 @@ export interface GhosttyConfigOptions {
   baseGhosttyConfig?: string | null;
 }
 
+/**
+ * Quote a value for a POSIX double-quoted shell string. The inner command is
+ * itself wrapped in single quotes (`zsh -lic '…'`), so double quotes nest
+ * cleanly and keep paths with spaces (e.g. iCloud's `~/Library/Mobile
+ * Documents/…`) from being split into two `cd` arguments.
+ */
+function shQuote(s: string): string {
+  return `"${s.replace(/(["$`\\])/g, '\\$1')}"`;
+}
+
 /** The `command = zsh -lic '…'` line that boots clabox for the box. */
 export function buildCommand(opts: GhosttyConfigOptions): string {
-  const cd = opts.projectDir ? `cd ${opts.projectDir} && ` : '';
-  const env = opts.configsDir ? `CLABOX_CONFIGS_DIR=${opts.configsDir} ` : '';
-  const inner = `${cd}${env}${opts.claboxBin} -b ${opts.boxName}; exec zsh`;
+  const cd = opts.projectDir ? `cd ${shQuote(opts.projectDir)} && ` : '';
+  const env = opts.configsDir ? `CLABOX_CONFIGS_DIR=${shQuote(opts.configsDir)} ` : '';
+  const inner = `${cd}${env}${shQuote(opts.claboxBin)} -b ${opts.boxName}; exec zsh`;
   // Login + interactive zsh so the GUI-launched app inherits the user's PATH
   // (/etc/zprofile→path_helper for Homebrew, ~/.zshrc for fnm/nvm/volta). A bare
   // `bash -c` gets only launchd's minimal PATH and can't find `node` (clabox's
