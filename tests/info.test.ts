@@ -103,6 +103,8 @@ const baseData: InfoData = {
   configDir: '/cfg',
   network: true,
   ulimitProcs: 1024,
+  procsRunning: 900,
+  ulimitEffective: 1924,
   claudeArgs: ['--settings', '{"includeCoAuthoredBy": false}'],
   mcpServers: [],
   hasSystemPrompt: false,
@@ -170,5 +172,22 @@ describe('formatInfo', () => {
     const colored = formatInfo(baseData, { color: true });
     expect(colored).toContain('\x1b[1m'); // bold section headers
     expect(colored).toContain('\x1b[36m'); // cyan labels
+  });
+});
+
+describe('formatInfo — ulimit row', () => {
+  test('shows the headroom, the effective cap and the running count', () => {
+    const out = formatInfo(baseData);
+    expect(out).toContain('ulimitProcs     1024 (headroom) → ulimit -u 1924, 900 procs running');
+  });
+
+  test('says no cap is set when the process count is unreadable', () => {
+    const out = formatInfo({ ...baseData, procsRunning: null, ulimitEffective: null });
+    expect(out).toContain('no cap set, process count unreadable');
+  });
+
+  test('(off) when the guard is disabled', () => {
+    const out = formatInfo({ ...baseData, ulimitProcs: 0, ulimitEffective: null });
+    expect(out).toContain('ulimitProcs     (off)');
   });
 });

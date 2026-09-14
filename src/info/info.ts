@@ -8,7 +8,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { boxSlug, buildBoxExtras } from '../sandbox/extras.js';
-import { profilePath, resolveProjectDir, which } from '../sandbox/run.js';
+import {
+  countUserProcs,
+  maxProcPerUid,
+  profilePath,
+  resolveProjectDir,
+  resolveUlimit,
+  which,
+} from '../sandbox/run.js';
 import { type BotConfig, type Config, expandHome, HOME, type PathRules } from '../utils/config.js';
 
 /** clabox's own package: the install root + version, located at runtime. */
@@ -81,7 +88,12 @@ export interface InfoData {
   /** Expanded `config.configDir` (Claude's profile dir). */
   configDir: string;
   network: boolean;
+  /** Configured process headroom (`config.ulimitProcs`). */
   ulimitProcs: number;
+  /** Processes currently owned by this uid; null when unreadable. */
+  procsRunning: number | null;
+  /** `ulimit -u` the launcher will actually set; null → no cap. */
+  ulimitEffective: number | null;
   claudeArgs: string[];
   /** Per-box MCP server names (keys of `config.mcp`). */
   mcpServers: string[];
@@ -127,6 +139,7 @@ export function gatherInfo(config: Config, opts: GatherInfoOptions = {}): InfoDa
   const profileFile = profilePath(projectDir);
   const claudeBin = config.claudeBin ?? which('claude');
   const pkg = resolveClaboxPackage();
+  const procsRunning = countUserProcs();
 
   const processEnv = TRACKED_ENV.filter((k) => process.env[k] != null).map(
     (k) => `${k}=${process.env[k]}`,
@@ -152,6 +165,11 @@ export function gatherInfo(config: Config, opts: GatherInfoOptions = {}): InfoDa
     configDir: expandHome(config.configDir),
     network: config.network,
     ulimitProcs: config.ulimitProcs,
+    procsRunning,
+    ulimitEffective: resolveUlimit(config.ulimitProcs, {
+      current: procsRunning,
+      hard: maxProcPerUid(),
+    }),
     claudeArgs: config.claudeArgs,
     mcpServers: Object.keys(config.mcp ?? {}),
     hasSystemPrompt: Boolean(
@@ -165,7 +183,8 @@ export function gatherInfo(config: Config, opts: GatherInfoOptions = {}): InfoDa
     paths: config.paths,
     denyHome: config.denyHome,
     denyDotConfigs: config.denyDotConfigs,
-    env: Object.entries(config.env ?? {}).map(([k, v]) => `${k}=${v}`),
+    // `null` = unset (`env -u KEY`); render it the way the launcher emits it.
+    env: Object.entries(config.env ?? {}).map(([k, v]) => (v === null ? `-u ${k}` : `${k}=${v}`)),
     extraArgs: extras.claudeArgs,
     extraFiles: extras.files.map((f) => f.path),
     processEnv,
@@ -250,7 +269,15 @@ export function formatInfo(d: InfoData, { color = false }: FormatInfoOptions = {
   row('configFile', d.configFile ? tildify(d.configFile) : '(defaults — no file)');
   row('configDir', tildify(d.configDir));
   row('network', d.network);
-  row('ulimitProcs', d.ulimitProcs || '(off)');
+  row(
+    'ulimitProcs',
+    d.ulimitProcs
+      ? d.ulimitEffective === null
+        ? `${d.ulimitProcs} (headroom — no cap set, process count unreadable)`
+        : `${d.ulimitProcs} (headroom) → ulimit -u ${d.ulimitEffective}` +
+          (d.procsRunning === null ? '' : `, ${d.procsRunning} procs running`)
+      : '(off)',
+  );
   row('bot', `${d.bot.name} <${d.bot.email}>`);
   row('mcp', d.mcpServers.join(', ') || '(none)');
   row('systemPrompt', d.hasSystemPrompt ? '(set)' : '(none)');
