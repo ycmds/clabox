@@ -51,6 +51,38 @@ export function canBuildApps(builder: AppBuilderConfig): { ok: boolean; reason?:
   return { ok: true };
 }
 
+/**
+ * Run the donor Ghostty's own `+validate-config` over a generated config.
+ *
+ * Ghostty does **not** fail loudly on a bad key — it logs and carries on, so a
+ * typo in `app.ghostty` (or a key that vanished in a Ghostty upgrade) shows up
+ * as an app that silently ignores half its settings. Asking the real binary at
+ * `init` time turns that into a warning while the user is still looking.
+ *
+ * Returns null when the config is fine **or** when validation isn't possible
+ * (no donor app, no such subcommand) — this is a nicety, never a build blocker.
+ */
+export function validateGhosttyConfig(
+  builder: AppBuilderConfig,
+  configPath: string,
+): string | null {
+  const bin = path.join(expandHome(builder.ghosttyApp), 'Contents', 'MacOS', 'ghostty');
+  if (!fs.existsSync(bin)) return null;
+  try {
+    execFileSync(bin, ['+validate-config', `--config-file=${configPath}`], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8',
+    });
+    return null;
+  } catch (e) {
+    const err = e as { status?: number; stderr?: string; stdout?: string };
+    // No `+validate-config` in this Ghostty → nothing to report.
+    if (err.status === undefined) return null;
+    const text = `${err.stdout ?? ''}${err.stderr ?? ''}`.trim();
+    return text || `ghostty +validate-config exited ${err.status}`;
+  }
+}
+
 /** Extract the donor app's entitlements to a tmp file, or null if it has none. */
 function extractEntitlements(ghosttyApp: string, tmpDir: string): string | null {
   let xml: string;

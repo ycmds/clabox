@@ -15,7 +15,7 @@ import {
   resolveBox,
 } from '../utils/config.js';
 import { buildAliasFiles } from './aliases.js';
-import { buildApp, canBuildApps } from './app.js';
+import { buildApp, canBuildApps, validateGhosttyConfig } from './app.js';
 import { appBundlePath, buildGhosttyConfig } from './ghostty.js';
 import { buildRaycastCommand } from './raycast.js';
 
@@ -204,6 +204,14 @@ async function buildAppArtifacts(
       }),
     );
     result.ghosttyConfigs.push(configPath);
+
+    // Ask the real Ghostty whether it actually understands what we just wrote —
+    // it ignores unknown keys silently, so a typo in `app.ghostty` would only
+    // show up as settings that mysteriously don't apply.
+    const configError = validateGhosttyConfig(config.appBuilder, configPath);
+    if (configError) {
+      result.warnings.push(`${name}: ghostty config has problems — ${configError}`);
+    }
 
     // Raycast command that opens the (to be) built bundle.
     const appPath = appBundlePath(expandHome(config.appBuilder.appsDir), app);

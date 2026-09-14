@@ -17,6 +17,7 @@ import {
   buildCommand,
   buildGhosttyConfig,
   buildLauncherSource,
+  buildShellCommand,
   bundleId,
 } from '../src/init/ghostty.js';
 import { buildRaycastCommand, raycastIcon } from '../src/init/raycast.js';
@@ -283,6 +284,39 @@ describe('ghostty config + launcher generation', () => {
     const cmd = buildCommand({ ...opts, configsDir: null, claboxBin: 'clabox' });
     expect(cmd).toBe(
       `command = zsh -lic 'cd "/Users/me/projects/ax-mg" && "clabox" -b ax-mg; exec zsh'`,
+    );
+  });
+
+  test('buildShellCommand appends extra args and survives a quote in them', () => {
+    const cmd = buildShellCommand({ ...opts, configsDir: null, extraArgs: ['--rc', "it's"] });
+    expect(cmd).toContain('-b ax-mg "--rc"');
+    // A bare `'` would close the outer single-quoted string early.
+    expect(cmd).toContain(`'\\''`);
+    expect(cmd.startsWith("zsh -lic '")).toBe(true);
+  });
+
+  test('buildShellCommand without a box runs plain clabox', () => {
+    const cmd = buildShellCommand({ ...opts, boxName: null, configsDir: null });
+    expect(cmd).not.toContain(' -b ');
+    expect(cmd).toContain('"/Users/me/.bun/bin/clabox"; exec zsh');
+  });
+
+  test('buildGhosttyConfig denies the escape sequences that read outside the box', () => {
+    const txt = buildGhosttyConfig(opts);
+    // Seatbelt can't see the terminal protocol: OSC 52 would hand a box the
+    // system clipboard, OSC 21 the window title.
+    expect(txt).toContain('clipboard-read = deny');
+    expect(txt).toContain('title-report = false');
+    expect(txt).toContain('window-colorspace = display-p3');
+  });
+
+  test('the box own ghostty keys are emitted after ours, so they win', () => {
+    const txt = buildGhosttyConfig({
+      ...opts,
+      app: { ...app, ghostty: { 'clipboard-read': 'allow' } },
+    });
+    expect(txt.indexOf('clipboard-read = allow')).toBeGreaterThan(
+      txt.indexOf('clipboard-read = deny'),
     );
   });
 
