@@ -59,6 +59,25 @@ describe('buildBoxExtras — MCP', () => {
     expect(buildBoxExtras(cfg({}), 's')).toEqual({ claudeArgs: [], files: [] });
     expect(buildBoxExtras(cfg({ mcp: {} }), 's')).toEqual({ claudeArgs: [], files: [] });
   });
+
+  // strictMcp:false drops ONLY the strict flag — `--mcp-config` still loads the
+  // box's own servers, but claude merges them with everything else it knows
+  // about, the claude.ai cloud connectors (Linear/Slack/…) included.
+  test('strictMcp:false emits a plain --mcp-config (cloud connectors survive)', () => {
+    const { claudeArgs, files } = buildBoxExtras(
+      cfg({ mcp: { a: { url: 'u' } }, strictMcp: false }),
+      'ax-mg',
+    );
+    const mcpFile = path.join(claboxMcpDir(), 'ax-mg.json');
+    expect(claudeArgs).toEqual(['--mcp-config', mcpFile]);
+    expect(files[0].path).toBe(mcpFile);
+  });
+
+  test('strictMcp defaults to true', () => {
+    expect(defaultConfig.strictMcp).toBe(true);
+    const { claudeArgs } = buildBoxExtras(cfg({ mcp: { a: { url: 'u' } } }), 'b');
+    expect(claudeArgs[0]).toBe('--strict-mcp-config');
+  });
 });
 
 describe('buildBoxExtras — systemPrompt', () => {
@@ -105,6 +124,42 @@ describe('buildBoxExtras — hooks', () => {
   test('no settings flag or file when hooks is absent or empty', () => {
     expect(buildBoxExtras(cfg({}), 's')).toEqual({ claudeArgs: [], files: [] });
     expect(buildBoxExtras(cfg({ hooks: {} }), 's')).toEqual({ claudeArgs: [], files: [] });
+  });
+
+  test('config.notify compiles into hooks that write to /dev/tty', () => {
+    const { claudeArgs, files } = buildBoxExtras(
+      cfg({ claudeArgs: [], notify: { enabled: true, stop: 'done', progress: true, bell: true } }),
+      'is-mg',
+    );
+    expect(claudeArgs).toContain('--settings');
+    const hooks = JSON.parse(files[0].content).hooks;
+    expect(hooks.Stop[0].hooks[0].command).toContain('> /dev/tty');
+    expect(hooks.Stop[0].hooks[0].command).toContain('777;notify;Claude · is-mg;done');
+    // `waiting` unset → no banner there, but progress/bell still mark the tab.
+    expect(hooks.Notification[0].hooks[0].command).toContain('9;4;4;0');
+    expect(hooks.Notification[0].hooks[0].command).not.toContain('777');
+  });
+
+  test('notify hooks are appended to the box hooks, never replacing them', () => {
+    const { files } = buildBoxExtras(
+      cfg({
+        claudeArgs: [],
+        hooks: stopHook,
+        notify: { enabled: true, stop: 'done' },
+      }),
+      'b',
+    );
+    const hooks = JSON.parse(files[0].content).hooks;
+    expect(hooks.Stop).toHaveLength(2);
+    expect(hooks.Stop[0].hooks[0].command).toBe('/h/notify.sh');
+    expect(hooks.Stop[1].hooks[0].command).toContain('printf');
+  });
+
+  test('notify off (the default) adds nothing at all', () => {
+    expect(buildBoxExtras(cfg({ notify: { enabled: false, stop: 'x' } }), 's')).toEqual({
+      claudeArgs: [],
+      files: [],
+    });
   });
 });
 

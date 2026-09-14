@@ -5,6 +5,7 @@
 
 import path from 'node:path';
 import { type Config, claboxMcpDir, claboxSettingsDir } from '../utils/config.js';
+import { buildNotifyHooks, mergeHooks } from './notify.js';
 
 /** A file to materialize before launching claude (absolute path + content). */
 export interface ExtraFile {
@@ -65,10 +66,12 @@ function readInlineSettings(claudeArgs: string[]): Record<string, unknown> {
  * read them; clabox writes them before launch, so no in-box write is needed.
  *
  * - MCP: written to `<claboxHome>/mcp/<slug>.json` and loaded with
- *   `--strict-mcp-config --mcp-config <file>` (global/plugin servers ignored).
+ *   `--mcp-config <file>`, preceded by `--strict-mcp-config` unless the box sets
+ *   `strictMcp: false` (strict also hides the claude.ai cloud connectors).
  * - systemPrompt: appended inline via `--append-system-prompt` (no file —
  *   nothing to leave stale; `string[]` is joined with blank lines).
- * - hooks: merged into the inline `--settings` (see {@link readInlineSettings})
+ * - hooks: `config.hooks` plus the compiled `config.notify` banners (see
+ *   `sandbox/notify.ts`), merged into the inline `--settings` (see {@link readInlineSettings})
  *   and written to `<claboxHome>/settings/<slug>.json`, loaded with
  *   `--settings <file>` — which, emitted after `config.claudeArgs`, wins the
  *   last-`--settings`-takes-all race while carrying the merged result.
@@ -84,14 +87,23 @@ export function buildBoxExtras(config: Config, slug: string): BoxExtras {
       path: mcpFile,
       content: `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
     });
-    claudeArgs.push('--strict-mcp-config', '--mcp-config', mcpFile);
+    // `--strict-mcp-config` means "only these servers" — and claude counts the
+    // claude.ai cloud connectors (Linear, Slack, …) among the configurations it
+    // then ignores, not just the configDir's own files. A box that wants its
+    // server *alongside* them sets `strictMcp: false` and gets a plain
+    // `--mcp-config`, which merges.
+    if (config.strictMcp !== false) claudeArgs.push('--strict-mcp-config');
+    claudeArgs.push('--mcp-config', mcpFile);
   }
 
   const sp = config.systemPrompt;
   const text = (Array.isArray(sp) ? sp.join('\n\n') : (sp ?? '')).trim();
   if (text) claudeArgs.push('--append-system-prompt', text);
 
-  const hooks = config.hooks;
+  // The box's own hooks plus, when `config.notify.enabled`, the compiled
+  // terminal-escape notifications — merged per event (concatenated), never
+  // replacing each other: a box that already pings with `afplay` keeps doing so.
+  const hooks = mergeHooks(config.hooks, buildNotifyHooks(config.notify, slug));
   if (hooks && Object.keys(hooks).length > 0) {
     const settingsFile = path.join(claboxSettingsDir(), `${slug}.json`);
     const merged = { ...readInlineSettings(config.claudeArgs), hooks };

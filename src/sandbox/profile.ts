@@ -210,13 +210,26 @@ export function buildProfile(
 
   add('Claude config & token files', allow('file-read* file-write*', subpath(configDir)));
 
+  // Claude's own scratch dirs, outside the config dir. Both need WRITE:
+  //   ~/.local/state/claude/locks/<version>.lock — the version lock claude takes
+  //     at startup; it writes a `.lock.tmp.<rand>` next to it, so a read-only
+  //     grant shows up in-box as `EPERM … locks/<version>.lock.tmp.xxxx` +
+  //     "NON-FATAL: Lock acquisition failed".
+  //   ~/Library/Caches/claude-cli-nodejs/** — the per-MCP-server log batches;
+  //     without write every batch is dropped ("Dropping log batch for …").
+  // Neither holds credentials (OAuth tokens live in the keychain), so RW here
+  // widens nothing that matters. `~/.cache/claude` stays read-only — nothing has
+  // been observed writing to it.
   add(
-    'Claude auto-update (RO) -- suppress warnings',
-    allow(
-      'file-read*',
-      subpath(path.join(HOME, '.local/state/claude')),
-      subpath(path.join(HOME, '.cache/claude')),
-    ),
+    'Claude runtime state & caches (RW) -- version lock + MCP logs',
+    [
+      allow(
+        'file-read* file-write*',
+        subpath(path.join(HOME, '.local/state/claude')),
+        subpath(path.join(HOME, 'Library/Caches/claude-cli-nodejs')),
+      ),
+      allow('file-read*', subpath(path.join(HOME, '.cache/claude'))),
+    ].join('\n'),
   );
 
   add(
