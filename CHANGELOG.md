@@ -1,3 +1,22 @@
+# [0.6.0](https://github.com/ycmds/clabox/compare/v0.5.0...v0.6.0) (2026-09-14)
+
+
+### Bug Fixes
+
+* **sandbox:** grant the resolved developer dir, not just /Applications/Xcode.app ([786eb51](https://github.com/ycmds/clabox/commit/786eb51b5c5c58e396a812047ad53d364588901b))
+
+
+### Features
+
+* **cli:** --rc / --env flags, plus the tab and daemon commands ([9a1e506](https://github.com/ycmds/clabox/commit/9a1e5066abf3b37d66f210de62a87255a005eb45))
+* **config:** tab looks, in-box notifications, env unsets, escape guards ([cacd2c9](https://github.com/ycmds/clabox/commit/cacd2c975bcecac52b8417a81b72366aad3ba661))
+* **daemon:** run claude's Remote Control supervisor outside the sandbox ([fccd379](https://github.com/ycmds/clabox/commit/fccd379451e2b3f5d57f7bffbaeeb1468090d66c))
+* **init:** harden generated Ghostty configs and validate them ([d03c304](https://github.com/ycmds/clabox/commit/d03c304a1339c6a52e55495071d0f37f3d5a19d3))
+* move per-box extras to clabox home + notification banners ([7fe88da](https://github.com/ycmds/clabox/commit/7fe88dade1a2334d5aff8057e6912e95fc5f6ce3))
+* **sandbox:** open a box in the running Ghostty via AppleScript ([c92860b](https://github.com/ycmds/clabox/commit/c92860bf472493f4fc221fd7b14ab40022839caa))
+* **sandbox:** tab decoration, tty echo guard and in-box notifications ([f24ae45](https://github.com/ycmds/clabox/commit/f24ae45dac48de6f9a5e41694b898ff79cee8ff7))
+* **sandbox:** wire the guards, the tab decor and the extras into the launcher ([791a4db](https://github.com/ycmds/clabox/commit/791a4dbef5710a02ffceb2ed715cc4442a8ec3f3))
+
 # [0.5.0](https://github.com/ycmds/clabox/compare/v0.4.0...v0.5.0) (2026-07-20)
 
 
