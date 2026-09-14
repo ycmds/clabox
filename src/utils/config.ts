@@ -105,6 +105,66 @@ export interface HookMatcher {
  */
 export type HooksConfig = Record<string, HookMatcher[]>;
 
+/**
+ * Terminal-tab appearance for a run — how *this* tab announces itself. Built
+ * into OSC escape sequences by `sandbox/tab.ts` and written only onto a real
+ * TTY. The point is telling two tabs of the same box apart: `--rc` talks to
+ * Remote Control (i.e. this session is reachable from the Claude app and
+ * feature-flag fetching is on), a plain tab doesn't — and they otherwise look
+ * identical.
+ */
+export interface TabConfig {
+  /** Fixed tab title. null → the project dir (`~`-shortened), as before. */
+  title?: string | null;
+  /** Prefixed to the title while `--rc` is on. null/'' → no badge. */
+  rcBadge?: string | null;
+  /** Background color (OSC 11) for this box: `#rgb`/`#rrggbb`/X11 name. null → untouched. */
+  background?: string | null;
+  /** Background used while `--rc` is on; wins over {@link TabConfig.background}. */
+  rcBackground?: string | null;
+  /** Foreground color (OSC 10) for this box. null → untouched. */
+  foreground?: string | null;
+  /** Foreground used while `--rc` is on; wins over {@link TabConfig.foreground}. */
+  rcForeground?: string | null;
+  /**
+   * Cursor color (OSC 12) for this box. null → untouched. The loudest marker of
+   * the three: a background is washed out by `background-opacity`/blur, a
+   * blinking cursor isn't.
+   */
+  cursor?: string | null;
+  /** Cursor used while `--rc` is on; wins over {@link TabConfig.cursor}. */
+  rcCursor?: string | null;
+}
+
+/**
+ * Desktop notifications for a box — compiled into claude hooks that write
+ * terminal escape sequences (`sandbox/notify.ts`), which is the only
+ * notification channel that survives the sandbox: `terminal-notifier` hangs and
+ * `osascript display notification` dies in-box, but the terminal emulator lives
+ * outside it and already reads `/dev/tty`.
+ *
+ * Opt-in (`enabled: false`), because turning it on injects hooks into the box's
+ * compiled settings.
+ */
+export interface NotifyConfig {
+  /** Master switch. Env: `CLABOX_NOTIFY=1`. */
+  enabled: boolean;
+  /** Banner title. null → `Claude · <box slug>`. */
+  title?: string | null;
+  /** Banner body when a reply lands (`Stop`). null → no notification there. */
+  stop?: string | null;
+  /** Banner body when claude blocks on you (`Notification`). null → off. */
+  waiting?: string | null;
+  /**
+   * Also drive the tab/dock progress indicator (OSC 9;4): yellow while claude
+   * waits for you, cleared when the reply lands. Unlike a banner it stays put
+   * while you're in another window.
+   */
+  progress?: boolean;
+  /** Also ring the bell (BEL) — Ghostty's `bell-features` decides what that does. */
+  bell?: boolean;
+}
+
 /** Extra rules layered on top of the built-in base profile. */
 export interface PathRules {
   /** RW subpaths (beyond project dir + configDir + /tmp). */
@@ -144,12 +204,27 @@ export interface Config {
   /**
    * Per-box MCP servers (the `mcpServers` map). clabox compiles them to
    * `<claboxHome>/mcp/<slug>.json` (i.e. `~/.config/clabox/mcp/…`, NOT the
-   * Claude configDir) and launches claude with
-   * `--strict-mcp-config --mcp-config <file>`, so a shared configDir's global /
-   * plugin MCP servers are ignored — each box gets exactly these and no more.
+   * Claude configDir) and launches claude with `--mcp-config <file>`, plus
+   * `--strict-mcp-config` unless {@link Config.strictMcp} is false.
    * Materialized on every `run` and during `init`. Absent → no MCP flags.
    */
   mcp?: Record<string, McpServer>;
+  /**
+   * Whether a box declaring {@link Config.mcp} *also* gets `--strict-mcp-config`
+   * (default `true`, env `CLABOX_STRICT_MCP=0`). Ignored without `mcp`.
+   *
+   * `true` — the box sees **exactly** its own servers: a shared configDir's
+   * global and plugin MCP servers are ignored. But claude reads "ignoring all
+   * other MCP configurations" wider than the config files: it also drops the
+   * **claude.ai connectors** (Linear, Slack, Figma, … — served through
+   * `mcp-proxy.anthropic.com`, which no local file declares), leaving only the
+   * built-ins (`claude-in-chrome`).
+   *
+   * `false` — a plain `--mcp-config`, which **merges**: the box's own servers on
+   * top of the account's cloud connectors and the configDir's own. Pick this for
+   * a box that wants its MCP *in addition to* the cloud ones.
+   */
+  strictMcp: boolean;
   /**
    * Text appended to claude's system prompt via `--append-system-prompt`.
    * `string[]` is joined with blank lines. Use it for per-box pre-prompts while
@@ -170,10 +245,37 @@ export interface Config {
    * Extra environment variables forced onto the sandboxed `claude` process,
    * layered over the inherited shell env and after the built-in hardening vars
    * (so a key set here wins). Use it to pass secrets like `GITHUB_TOKEN`.
+   *
+   * A **`null` value means "unset it"** (`env -u KEY`) — the way to *drop* a var
+   * the shell (or a shared preset) exported, which no assignment can do. That
+   * matters for claude's privacy vars: `DISABLE_TELEMETRY` / `DO_NOT_TRACK` /
+   * `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` / `DISABLE_GROWTHBOOK` turn off
+   * feature-flag fetching, which hides Remote Control (`/rc`) and the other
+   * flag-gated features — so a box that wants `/rc` has to unset them, not
+   * merely set them to `0` (claude reads the first three as "any non-empty
+   * value", `0`/`false` included).
    */
-  env: Record<string, string>;
+  env: Record<string, string | null>;
   /** Allow outbound network. `false` → no `(allow network*)` line. */
   network: boolean;
+  /**
+   * Let the box hand work to claude's **background tasks** (`false` by default,
+   * i.e. they're disabled in-box).
+   *
+   * This is a sandbox **escape hatch**, not a convenience toggle. A background
+   * task isn't forked by the sandboxed claude — the request goes over a socket
+   * to the singleton `claude daemon run` supervisor, which lives outside every
+   * box (PPID 1 / launchd) and re-launches the session with `--fork-session
+   * --resume`. The new process carries the same session id and the same
+   * transcript but **no Seatbelt profile**: full read/write as the user, with
+   * the box's system prompt still claiming it's sandboxed. Seatbelt is bound to
+   * a process, a session is bound to a file, and background handoff swaps the
+   * process — so the sandbox is simply gone. See docs/troubleshooting.md.
+   *
+   * Left `false`, the launcher forces {@link SANDBOX_ESCAPE_GUARDS} into the
+   * box env. Flip it only for a box you'd be happy to run unsandboxed.
+   */
+  allowBackgroundTasks: boolean;
   /** Cap the process table inside the sandbox (fork-bomb guard). 0 → skip. */
   ulimitProcs: number;
   paths: PathRules;
@@ -181,6 +283,18 @@ export interface Config {
   denyHome: string[];
   /** Dotfile config dirs under $HOME denied entirely. */
   denyDotConfigs: string[];
+  /**
+   * How the terminal tab looks while this box runs (title + background color).
+   * The `rc*` fields kick in for a `--rc` launch, so a Remote-Control tab is
+   * visually distinct from a private one.
+   */
+  tab?: TabConfig;
+  /**
+   * Opt-in desktop notifications that work *inside* the sandbox, by writing
+   * terminal escape sequences to `/dev/tty` from compiled hooks. See
+   * {@link NotifyConfig} and `sandbox/notify.ts`.
+   */
+  notify?: NotifyConfig;
   /**
    * Opt-in: build a standalone Ghostty app for this box during `clabox init`.
    * Absent → the box only gets a shell alias (the default).
@@ -190,12 +304,25 @@ export interface Config {
   appBuilder: AppBuilderConfig;
 }
 
+/**
+ * Read a `config.tab` env override: unset → the built-in default, set-but-empty
+ * → `null` (explicitly "off", e.g. `CLABOX_TAB_RC_BACKGROUND=` to stop the
+ * `--rc` repaint without writing a config file).
+ */
+function tabEnv(raw: string | undefined, fallback: string | null): string | null {
+  if (raw === undefined) return fallback;
+  return raw.trim() || null;
+}
+
 /** Built-in defaults. Everything here is meant to be overridable. */
 export const defaultConfig: Config = {
   cwd: env.CLABOX_CWD ?? null,
   claudeBin: env.CLABOX_CLAUDE_BIN ?? null,
   configDir: env.CLAUDE_CONFIG_DIR ?? '~/.claude',
   claudeArgs: ['--settings', '{"includeCoAuthoredBy": false}'],
+  // Strict by default: a box gets exactly its own MCP servers. Set false (or
+  // CLABOX_STRICT_MCP=0) to keep the claude.ai cloud connectors alongside them.
+  strictMcp: env.CLABOX_STRICT_MCP !== '0',
   bot: {
     name: env.CLABOX_BOT_NAME ?? 'claudeBOT',
     email: env.CLABOX_BOT_EMAIL ?? 'bot@example.com',
@@ -203,6 +330,9 @@ export const defaultConfig: Config = {
   },
   env: {},
   network: true,
+  // Background tasks escape the sandbox (they're launched by the unsandboxed
+  // daemon, not forked in-box) — off unless a box explicitly opts in.
+  allowBackgroundTasks: env.CLABOX_ALLOW_BACKGROUND_TASKS === '1',
   ulimitProcs: 1024,
   paths: {
     readWrite: [],
@@ -217,6 +347,34 @@ export const defaultConfig: Config = {
   denyHome: ['Documents', 'Desktop', 'Downloads', 'Pictures', 'Movies', 'Music'],
   // `.config/git` is always carved back out for git RO config in the profile.
   denyDotConfigs: ['aws', 'gnupg', 'kube', 'docker', 'config'],
+  // Tab looks: plain runs keep the terminal's own colors, a `--rc` run repaints
+  // them so a Remote-Control tab can't be mistaken for a private one. The
+  // background alone is easy to miss (a box with `background-opacity`/blur
+  // washes it out, and on a dark theme every dark tint looks the same), so the
+  // `--rc` default is a warm, clearly-not-your-theme background plus a bright
+  // amber cursor — small, moving, and impossible to miss. Each is overridable
+  // per box or by env, where an empty value (`CLABOX_TAB_RC_CURSOR=`) means off.
+  tab: {
+    title: tabEnv(env.CLABOX_TAB_TITLE, null),
+    rcBadge: tabEnv(env.CLABOX_TAB_RC_BADGE, '📡 RC'),
+    background: tabEnv(env.CLABOX_TAB_BACKGROUND, null),
+    rcBackground: tabEnv(env.CLABOX_TAB_RC_BACKGROUND, '#5c1a00'),
+    foreground: tabEnv(env.CLABOX_TAB_FOREGROUND, null),
+    rcForeground: tabEnv(env.CLABOX_TAB_RC_FOREGROUND, null),
+    cursor: tabEnv(env.CLABOX_TAB_CURSOR, null),
+    rcCursor: tabEnv(env.CLABOX_TAB_RC_CURSOR, '#ff8c1a'),
+  },
+  // Off by default: switching it on injects hooks into the box's settings, and
+  // a box that already has its own notification hooks shouldn't grow a second
+  // banner behind the user's back. `CLABOX_NOTIFY=1` turns it on machine-wide.
+  notify: {
+    enabled: env.CLABOX_NOTIFY === '1',
+    title: tabEnv(env.CLABOX_NOTIFY_TITLE, null),
+    stop: 'reply is ready',
+    waiting: 'waiting for you',
+    progress: true,
+    bell: true,
+  },
   // `app` is opt-in per box, so there's no default — it stays undefined.
   appBuilder: {
     ghosttyApp: env.CLABOX_GHOSTTY_APP ?? '/Applications/Ghostty.app',
@@ -272,6 +430,78 @@ export function withExtraPaths(
       readWrite: [...config.paths.readWrite, ...readWrite],
     },
   };
+}
+
+/**
+ * The env vars that turn claude's **feature-flag fetching** off. Any one of them,
+ * from any source (the box `env`, the login shell, a `settings.json` `env`
+ * block), is enough — and with fetching off the flag-gated features fall back to
+ * their code defaults, which hides Remote Control (`/rc`), auto mode by default,
+ * cross-machine session messaging, `/import`, `/skill-doctor` and more:
+ * https://code.claude.com/docs/en/env-vars#features-that-need-feature-flag-fetching
+ *
+ * The first two count **any non-empty value** (`0` and `false` included), so
+ * they can only be neutralized by *unsetting* them — which is what the `--rc`
+ * CLI flag does (it maps to `withExtraEnv(config, FLAG_FETCH_BLOCKERS)`).
+ */
+/**
+ * Env vars the launcher forces into every box that hasn't set
+ * {@link Config.allowBackgroundTasks} — the vars that close claude's
+ * **background-task escape hatch**.
+ *
+ * Why it's an escape and not just a feature: a background task is not forked by
+ * the sandboxed claude (a macOS sandbox is inherited and can't be dropped, so a
+ * real fork would stay confined). The in-box process asks the singleton
+ * `claude daemon run` supervisor over its control socket, and that daemon runs
+ * **outside every box** — PPID 1, started by launchd, no `sandbox-exec` anywhere
+ * in its ancestry. It answers by launching `claude --fork-session --resume
+ * <same-session-id>`, so the work continues with the identical transcript and an
+ * empty Seatbelt policy. Observed ancestry of such a session:
+ *
+ *     zsh ← claude --fork-session --resume ← ClaudeCode.app --bg-pty-host
+ *         ← claude daemon run   (PPID 1, launchd)
+ *
+ * It reads `~/Library/Logs/DiagnosticReports`, writes `~/Desktop`, and still
+ * carries the box's "you're in a sandbox" system prompt. Only the keychain-level
+ * hard denies survive, because they're macOS ACLs rather than profile rules.
+ *
+ * Emitted **before** `config.env` so a box (or `-e KEY=VALUE`) can still
+ * override them — the guard is a default, not a lock.
+ */
+export const SANDBOX_ESCAPE_GUARDS: Record<string, string> = {
+  CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
+};
+
+export const FLAG_FETCH_BLOCKERS = [
+  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  'DISABLE_TELEMETRY',
+  'DO_NOT_TRACK',
+  'DISABLE_GROWTHBOOK',
+];
+
+/**
+ * Layer ad-hoc env overrides (from the repeatable `--env`/`-e` CLI flag) onto
+ * `config.env`. Each entry is either `KEY=VALUE` (set it) or a bare `KEY`
+ * (**unset** it — emitted as `env -u KEY`, the only way to drop a var a shared
+ * preset or the shell exported). Later entries win, and they win over the
+ * config's own `env`, so one tab can differ from its box without a new config:
+ *
+ *     clabox -b ax-mg -e DISABLE_TELEMETRY      # this tab gets /rc
+ *     clabox -b ax-mg -e DISABLE_TELEMETRY=1    # this tab stays private
+ *
+ * Pure; returns the same config when nothing is passed. Entries without a name
+ * (e.g. `=1`) are ignored rather than producing a broken `env` argument.
+ */
+export function withExtraEnv(config: Config, entries: string[] = []): Config {
+  if (!entries.length) return config;
+  const env: Record<string, string | null> = { ...(config.env ?? {}) };
+  for (const entry of entries) {
+    const eq = entry.indexOf('=');
+    const key = (eq === -1 ? entry : entry.slice(0, eq)).trim();
+    if (!key) continue;
+    env[key] = eq === -1 ? null : entry.slice(eq + 1);
+  }
+  return { ...config, env };
 }
 
 /**
