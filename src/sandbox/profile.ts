@@ -93,6 +93,44 @@ export function resolvedClaboxHome(): string[] {
   return realHome === home ? [] : [realHome];
 }
 
+/** The toolchain roots granted statically, before any symlink resolution. */
+const STATIC_DEVELOPER_DIRS = ['/Library/Developer/CommandLineTools', '/Applications/Xcode.app'];
+
+/**
+ * The **resolved** developer directories to grant on top of
+ * {@link STATIC_DEVELOPER_DIRS} — Seatbelt matches the symlink-resolved path, so
+ * a nominal grant misses a toolchain that lives behind a link.
+ *
+ * `/usr/bin/python3` (like `clang`, `git`, `swift`…) is a shim that execs the
+ * *selected* toolchain, i.e. whatever `xcode-select -p` points at. On a dev mac
+ * that's the real `/Applications/Xcode.app`, which the static grant covers. On a
+ * CI runner the bundle is versioned (`/Applications/Xcode_16.4.app`) with
+ * `Xcode.app` a symlink onto it, so the static grant resolves to nothing and
+ * CPython dies before it starts — the symptom that shows up as the entropy
+ * regression test failing only in CI.
+ *
+ * Read through `/var/db/xcode_select_link` (the link `xcode-select` maintains)
+ * rather than by running `xcode-select`, keeping this to `fs` autodetection.
+ * Best-effort: an unreadable or absent link contributes nothing.
+ */
+export function resolvedDeveloperDirs(): string[] {
+  const out = new Set<string>();
+  for (const p of ['/var/db/xcode_select_link', ...STATIC_DEVELOPER_DIRS]) {
+    let real: string;
+    try {
+      if (!fs.existsSync(p)) continue;
+      real = fs.realpathSync(p);
+    } catch {
+      continue;
+    }
+    // `xcode_select_link` points at `<bundle>/Contents/Developer`; grant the
+    // whole bundle, since the shims reach outside Contents/Developer too.
+    const root = real.replace(/\/Contents\/Developer$/, '');
+    if (!STATIC_DEVELOPER_DIRS.includes(root)) out.add(root);
+  }
+  return [...out];
+}
+
 /** Context needed to assemble a profile for a specific project. */
 export interface ProfileContext {
   projectDir: string;
@@ -160,19 +198,14 @@ export function buildProfile(
     ),
   );
 
+  // The static pair plus wherever `xcode-select` actually points once symlinks
+  // are resolved — see resolvedDeveloperDirs().
+  const developerDirs = [...STATIC_DEVELOPER_DIRS, ...resolvedDeveloperDirs()];
   add(
     'Xcode / Command Line Tools (xcrun, git, etc.)',
     [
-      allow(
-        'file-read* file-map-executable',
-        subpath('/Library/Developer/CommandLineTools'),
-        subpath('/Applications/Xcode.app'),
-      ),
-      allow(
-        'process-exec',
-        subpath('/Library/Developer/CommandLineTools'),
-        subpath('/Applications/Xcode.app'),
-      ),
+      allow('file-read* file-map-executable', ...developerDirs.map(subpath)),
+      allow('process-exec', ...developerDirs.map(subpath)),
     ].join('\n'),
   );
 

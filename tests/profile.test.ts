@@ -11,7 +11,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildProfile, globToRegexBody } from '../src/sandbox/profile.js';
+import { buildProfile, globToRegexBody, resolvedDeveloperDirs } from '../src/sandbox/profile.js';
 import { buildEnvArgs, resolveProjectDir } from '../src/sandbox/run.js';
 import { defaultConfig, findConfigFile, mergeConfig, withExtraPaths } from '../src/utils/config.js';
 
@@ -241,6 +241,33 @@ describe('profile text generation', () => {
       expect(p.indexOf(`(subpath "${realHome}")`)).toBeGreaterThan(hardIdx);
     });
   });
+
+  describe('Xcode / Command Line Tools', () => {
+    test('grants the static toolchain pair', () => {
+      const p = build();
+      expect(p).toContain('(subpath "/Library/Developer/CommandLineTools")');
+      expect(p).toContain('(subpath "/Applications/Xcode.app")');
+    });
+
+    // `/usr/bin/python3` & co exec the *selected* toolchain, and Seatbelt matches
+    // the symlink-resolved path — so a CI runner's versioned bundle
+    // (`Xcode_16.4.app` behind an `Xcode.app` link) has to be granted explicitly
+    // or CPython dies at preinit. Machine-dependent by nature: assert the
+    // profile carries whatever the resolver found, which holds on every host.
+    test('grants the resolved developer dir too, for read and exec', () => {
+      const p = build();
+      const execSection = p.slice(p.indexOf('Xcode / Command Line Tools'));
+      for (const dir of resolvedDeveloperDirs()) {
+        expect(p).toContain(`(subpath "${dir}")`);
+        expect(execSection).toContain(`(subpath "${dir}")`);
+      }
+    });
+
+    test('never repeats a dir that is already granted statically', () => {
+      expect(resolvedDeveloperDirs()).not.toContain('/Applications/Xcode.app');
+      expect(resolvedDeveloperDirs()).not.toContain('/Library/Developer/CommandLineTools');
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -457,7 +484,11 @@ describe('sandbox enforcement (real sandbox-exec)', () => {
     });
     fs.rmSync(root, { recursive: true, force: true });
     expect(r.stderr).not.toContain('HashRandomization');
-    expect(r.status).toBe(0);
+    // Report what the sandbox actually said: a bare `status !== 0` tells you
+    // nothing about *which* path was denied, and this test only ever fails on a
+    // machine you don't have in front of you (a CI runner selecting a versioned
+    // Xcode bundle was the first such case).
+    expect(`status=${r.status}\nstderr=${r.stderr}`).toBe('status=0\nstderr=');
     expect(r.stdout.trim()).toBe('ok');
   });
 
