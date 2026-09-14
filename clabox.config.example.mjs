@@ -37,7 +37,19 @@ export default {
   // Outbound network (set false to cut it off entirely).
   network: true,
 
-  // Process-table cap inside the sandbox (fork-bomb guard); 0 to disable.
+  // Claude's background tasks — a sandbox ESCAPE HATCH, off by default.
+  // A background task isn't forked by the sandboxed claude: the request goes to
+  // the singleton `claude daemon run` supervisor, which lives OUTSIDE every box
+  // (PPID 1 / launchd) and re-launches the session with `--fork-session
+  // --resume`. Same session id, same transcript, NO Seatbelt profile — the box
+  // is simply gone, while its system prompt still claims otherwise.
+  // Set true only for a box you'd be happy to run unsandboxed.
+  allowBackgroundTasks: false,
+
+  // Fork-bomb guard: how many processes the box may add ON TOP of what this
+  // user already runs (macOS counts RLIMIT_NPROC per uid, machine-wide, so an
+  // absolute cap below the current count would make every fork in the box fail
+  // — including claude's keychain read). 0 to disable.
   ulimitProcs: 1024,
 
   // Per-box claude hooks (claude's settings.json `hooks` map). clabox merges
@@ -70,6 +82,39 @@ export default {
   // Dotfile config dirs under $HOME denied entirely (.config/git is re-allowed
   // read-only regardless, so git keeps working).
   denyDotConfigs: ['aws', 'gnupg', 'kube', 'docker', 'config'],
+
+  // How the terminal tab looks while this box runs. The `rc*` fields kick in
+  // for a `clabox --rc` launch, so a tab that's reachable from the Claude app
+  // (feature flags on, /rc available) can't be mistaken for a private one.
+  // Written only onto a real TTY; every color is reset when claude exits.
+  // Background AND cursor by default: `background-opacity`/blur washes a
+  // background out, a blinking cursor stays obvious. Env overrides:
+  // CLABOX_TAB_TITLE, CLABOX_TAB_RC_BADGE, CLABOX_TAB_{,RC_}BACKGROUND,
+  // CLABOX_TAB_{,RC_}CURSOR, CLABOX_TAB_{,RC_}FOREGROUND (empty value = off).
+  tab: {
+    title: null, // fixed title; null → the project dir, `~`-shortened
+    rcBadge: '📡 RC', // prefixed to the title while --rc is on; null → none
+    background: null, // e.g. '#0d1117'; null → keep the terminal's own
+    rcBackground: '#5c1a00', // --rc background; null → fall back to `background`
+    cursor: null, // e.g. '#58a6ff'; null → keep the terminal's own
+    rcCursor: '#ff8c1a', // --rc cursor; null → fall back to `cursor`
+    foreground: null, // text color; null → keep the terminal's own
+    rcForeground: null, // --rc text color; off by default (readability)
+  },
+
+  // Desktop notifications that work INSIDE the sandbox: clabox compiles these
+  // into claude hooks that write terminal escape sequences to /dev/tty (Ghostty
+  // renders OSC 777 as a real banner, OSC 9;4 as tab/dock progress, BEL as the
+  // bell). terminal-notifier/osascript can't work in a box — they need mach
+  // services Seatbelt denies. Off by default; env: CLABOX_NOTIFY=1.
+  notify: {
+    enabled: false,
+    title: null, // null → `Claude · <box>`
+    stop: 'reply is ready', // banner when a reply lands; null → no banner
+    waiting: 'waiting for you', // banner when claude blocks on you; null → off
+    progress: true, // yellow tab while it waits, cleared when the reply lands
+    bell: true, // BEL — ghostty's `bell-features` decides what that does
+  },
 
   // Opt-in: turn this box into a standalone Ghostty app. With `app` present,
   // `clabox init` writes a Ghostty config (with a `command` that runs
