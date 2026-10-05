@@ -9,9 +9,21 @@
 //   bun test
 
 import { describe, expect, test } from 'bun:test';
-import { buildEnvArgs, countUserProcs, maxProcPerUid, resolveUlimit } from '../src/sandbox/run.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  buildEnvArgs,
+  buildProfileText,
+  countUserProcs,
+  generateProfile,
+  maxProcPerUid,
+  profilePath,
+  resolveUlimit,
+} from '../src/sandbox/run.js';
 import {
   type Config,
+  claboxHomeDir,
   defaultConfig,
   FLAG_FETCH_BLOCKERS,
   SANDBOX_ESCAPE_GUARDS,
@@ -175,5 +187,67 @@ describe('--rc (FLAG_FETCH_BLOCKERS)', () => {
   test('an explicit `-e KEY=VALUE` after --rc still wins (flag is a default)', () => {
     const entries = [...FLAG_FETCH_BLOCKERS, 'DISABLE_TELEMETRY=1'];
     expect(withExtraEnv(cfg({}), entries).env.DISABLE_TELEMETRY).toBe('1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Where the profile lives (and that the launch doesn't need a file at all)
+//
+// The profile used to be written to `$TMPDIR/clabox-<dir>-<hash>.sb`, and the
+// base policy grants the whole `$TMPDIR` read-write — so the file holding a
+// box's policy was writable *by that box*, at a path derived from the project
+// dir. Overwrite it with `(version 1)(allow default)` between the write and the
+// `sandbox-exec -f` (the launcher does several more fork/execs in between, and
+// nothing reaps processes the box left running) and the next launch of that box
+// is unsandboxed; or replace it with a symlink and have the launcher truncate
+// whatever it points at.
+// ---------------------------------------------------------------------------
+
+describe('profile materialization', () => {
+  test('the profile path is NOT under $TMPDIR any more', () => {
+    const p = profilePath('/proj/box');
+    expect(p.startsWith(os.tmpdir())).toBe(false);
+    expect(p.startsWith(`${claboxHomeDir()}/profiles/`)).toBe(true);
+    // …and it stays deterministic per project dir.
+    expect(profilePath('/proj/box')).toBe(p);
+    expect(profilePath('/proj/other')).not.toBe(p);
+  });
+
+  test('the text handed to sandbox-exec is built in memory', () => {
+    // `runClaude` passes this to `sandbox-exec -p`, so no file is involved in
+    // the launch path at all.
+    const text = buildProfileText(cfg({}), '/proj/box');
+    expect(text).toContain('(version 1)\n(deny default)');
+    expect(text).toContain('(subpath "/proj/box")');
+    // Comfortably inside ARG_MAX (1 MB on macOS), which is what makes the
+    // fileless launch viable.
+    expect(text.length).toBeLessThan(100_000);
+  });
+
+  test('`clabox generate` writes 0600, atomically, and never through a symlink', () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cb-prof-')));
+    const prev = process.env.CLABOX_CONFIGS_DIR;
+    process.env.CLABOX_CONFIGS_DIR = path.join(home, 'configs');
+    try {
+      const target = path.join(home, 'victim');
+      fs.writeFileSync(target, 'precious');
+      const file = profilePath('/proj/box');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      // A symlink planted at the profile path must not be written through.
+      fs.symlinkSync(target, file);
+
+      const written = generateProfile(cfg({}), '/proj/box');
+      expect(written).toBe(file);
+      expect(fs.readFileSync(target, 'utf8')).toBe('precious'); // untouched
+      expect(fs.lstatSync(file).isSymbolicLink()).toBe(false); // replaced, not followed
+      expect(fs.readFileSync(file, 'utf8')).toContain('(version 1)');
+      expect(fs.statSync(file).mode & 0o077).toBe(0); // owner-only
+      // No stage files left behind.
+      expect(fs.readdirSync(path.dirname(file)).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.CLABOX_CONFIGS_DIR;
+      else process.env.CLABOX_CONFIGS_DIR = prev;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 });

@@ -4,18 +4,42 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { type Config, expandHome, HOME, SANDBOX_ESCAPE_GUARDS } from '../utils/config.js';
+import {
+  type Config,
+  claboxBinDir,
+  claboxHomeDir,
+  expandHome,
+  HOME,
+  projectDirOf,
+  SANDBOX_ESCAPE_GUARDS,
+} from '../utils/config.js';
 import { boxSlug, buildBoxExtras, type ExtraFile } from './extras.js';
+import { ensureProcTools } from './proctools.js';
 import { buildProfile, detectPackagePaths } from './profile.js';
 import { buildTabDecor } from './tab.js';
 import { sttyIo, suppressEcho } from './tty.js';
 
-const TMPDIR = (process.env.TMPDIR || '/tmp').replace(/\/$/, '');
-
-/** Deterministic per-project profile path under TMPDIR. */
+/**
+ * Deterministic per-project profile path — under `<claboxHome>/profiles`, NOT
+ * `$TMPDIR`.
+ *
+ * It used to be `$TMPDIR/clabox-<dir>-<hash>.sb`, and the whole `$TMPDIR` tree
+ * is granted RW by the base policy, so the file holding a box's own policy was
+ * writable *by that box* at a fully predictable path. Two ways that pays off:
+ * overwrite it with `(version 1)(allow default)` and the next launch of the box
+ * runs claude unsandboxed (the launcher does several more fork/execs between
+ * writing the file and `sandbox-exec -f`, and nothing reaps processes the box
+ * left behind), or replace it with a symlink and have the next launch truncate
+ * whatever it points at.
+ *
+ * `runClaude` no longer reads this file at all — it passes the profile text
+ * inline (`sandbox-exec -p`), so there is no file to race. What's left here is
+ * the materialized copy for `clabox generate` / `info`, and it lives under the
+ * clabox home, which the profile re-grants READ-ONLY in-box.
+ */
 export function profilePath(projectDir: string = process.cwd()): string {
   const hash = crypto.createHash('sha256').update(projectDir).digest('hex').slice(0, 8);
-  return path.join(TMPDIR, `clabox-${path.basename(projectDir)}-${hash}.sb`);
+  return path.join(claboxHomeDir(), 'profiles', `clabox-${path.basename(projectDir)}-${hash}.sb`);
 }
 
 /**
@@ -23,7 +47,7 @@ export function profilePath(projectDir: string = process.cwd()): string {
  * absolute path so SBPL `subpath` rules stay valid) if set, else the shell CWD.
  */
 export function resolveProjectDir(config: Config): string {
-  return config.cwd ? path.resolve(expandHome(config.cwd)) : process.cwd();
+  return projectDirOf(config);
 }
 
 /** Resolve a binary via the shell's `command -v`; null if not on PATH. */
@@ -52,15 +76,54 @@ export function resolveClaudeBin(config: Config): string {
   return candidate;
 }
 
-/** Generate the profile file for the current project, return its path. */
+/** The SBPL text for this config+project — what `sandbox-exec -p` is handed. */
+export function buildProfileText(
+  config: Config,
+  projectDir: string = resolveProjectDir(config),
+): string {
+  return buildProfile(config, { projectDir, detectedPaths: detectPackagePaths() });
+}
+
+/**
+ * Materialize the profile for inspection (`clabox generate`) and return its
+ * path. **Not** part of the launch path any more — `runClaude` passes the text
+ * inline, see {@link profilePath}.
+ *
+ * Written `0600` through an `O_EXCL` stage + `rename`, the same pattern
+ * `init/app.ts` and `proctools.ts` use: `writeFileSync` straight onto the final
+ * path follows a symlink planted there and truncates the target, and a reader
+ * could otherwise catch a half-written profile.
+ */
 export function generateProfile(
   config: Config,
   projectDir: string = resolveProjectDir(config),
 ): string {
   requireSandboxExec();
   const file = profilePath(projectDir);
-  const text = buildProfile(config, { projectDir, detectedPaths: detectPackagePaths() });
-  fs.writeFileSync(file, text);
+  const text = buildProfileText(config, projectDir);
+  const stage = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // 'wx' = O_CREAT|O_EXCL — never follow a symlink, never reuse a file.
+    fs.writeFileSync(stage, text, { mode: 0o600, flag: 'wx' });
+    fs.renameSync(stage, file);
+  } catch (e) {
+    // The likeliest failure by far: running `clabox generate` from *inside* a
+    // box, where the clabox home is deliberately read-only (that's the rule
+    // that stops a box rewriting its own policy). Say so, instead of leaving an
+    // `EPERM: mkdir` to be read as a broken install.
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'EROFS') {
+      throw new Error(
+        `clabox: cannot write the profile to ${file} (${err.code}) — the clabox home is\n` +
+          'read-only inside a box, on purpose. Run `clabox generate` from an unsandboxed\n' +
+          'shell, or `clabox info` to see the resolved grants.',
+      );
+    }
+    throw e;
+  } finally {
+    fs.rmSync(stage, { force: true });
+  }
   return file;
 }
 
@@ -70,7 +133,10 @@ export function buildEnvArgs(config: Config): string[] {
   const botKey = path.join(sshDir, 'id_ed25519');
   const botCfg = path.join(sshDir, 'config');
   const args = [
-    `PATH=${path.join(HOME, '.local/bin')}:${process.env.PATH || ''}`,
+    // `<claboxHome>/bin` goes first so the box's `ps` resolves to the
+    // de-privileged copy (see proctools.ts) instead of the setuid /bin/ps,
+    // which Seatbelt refuses to exec at all.
+    `PATH=${claboxBinDir()}:${path.join(HOME, '.local/bin')}:${process.env.PATH || ''}`,
     `CLAUDE_CONFIG_DIR=${expandHome(config.configDir)}`,
     `GIT_AUTHOR_NAME=${config.bot.name}`,
     `GIT_AUTHOR_EMAIL=${config.bot.email}`,
@@ -202,7 +268,12 @@ export function runClaude(
 ): number {
   const projectDir = resolveProjectDir(config);
   const claudeBin = resolveClaudeBin(config);
-  const profileFile = generateProfile(config, projectDir);
+  requireSandboxExec();
+  // The profile is built in memory and handed to `sandbox-exec -p` as one argv
+  // entry — no file anywhere in the launch path, so there is nothing for the box
+  // to race or symlink-swap between "write policy" and "apply policy" (see
+  // profilePath). It costs nothing: the profile is ~8 KB against a 1 MB ARG_MAX.
+  const profileText = buildProfileText(config, projectDir);
 
   // Compile the box's declarative mcp / systemPrompt into claude args, and
   // materialize the files they reference (under ~/.config/clabox, granted RO
@@ -210,12 +281,21 @@ export function runClaude(
   const extras = buildBoxExtras(config, boxSlug(configFile, projectDir));
   const extraFiles = writeExtraFiles(extras.files);
 
+  // Refresh the de-privileged `ps` the box's PATH points at. Best-effort by
+  // construction: without it the agent is just blind again, as it was before.
+  const procTools = ensureProcTools();
+
   if (process.env.CLABOX_DEBUG) {
     console.error(`→ Running Claude Code sandboxed in:  ${projectDir}`);
-    console.error(`→ Profile: ${profileFile}`);
+    console.error(
+      `→ Profile: inline (${profileText.length} bytes) — \`clabox generate\` to inspect`,
+    );
     console.error(`→ Config:  ${expandHome(config.configDir)}`);
     if (configFile) console.error(`→ Config file: ${configFile}`);
     for (const f of extraFiles) console.error(`→ MCP:     ${f}`);
+    for (const t of procTools) {
+      console.error(`→ Tool:    ${t.path} (${t.status}${t.warning ? `: ${t.warning}` : ''})`);
+    }
   }
 
   // Tab looks: title (cwd with `~` for $HOME, as the bash version did) plus,
@@ -230,8 +310,11 @@ export function runClaude(
   const defaultArgs = Array.isArray(config.claudeArgs) ? config.claudeArgs : [];
   const inner = [
     'sandbox-exec',
-    '-f',
-    profileFile,
+    // `-p <text>`, not `-f <file>`: see profilePath. Passed as its own argv
+    // entry through `exec "$@"`, so the newlines and quotes in it are never
+    // re-parsed by the shell.
+    '-p',
+    profileText,
     'env',
     ...envArgs,
     claudeBin,
