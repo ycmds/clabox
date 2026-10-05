@@ -1,8 +1,8 @@
 // Pure builders for the Ghostty-app artifacts emitted by `clabox init`.
 //
 // For a box that opts in via `app` (see AppConfig), `init` generates a Ghostty
-// config whose `command` launches `clabox -b <box>`, then clones Ghostty.app
-// with a tiny C launcher that bakes in `--config-file=<that config>`. Everything
+// config whose `command` launches `clabox -b <box>`, then clones Ghostty.app and
+// points the clone at that config through a private `XDG_CONFIG_HOME`. Everything
 // here is text-only (no I/O) so it can be unit-tested without macOS; the actual
 // build lives in init/app.ts.
 
@@ -30,6 +30,20 @@ export interface BoxCommandOptions {
   claboxBin: string;
   /** Extra args appended after `-b <box>` (e.g. `['--rc']`). */
   extraArgs?: string[];
+  /**
+   * The private `XDG_CONFIG_HOME` an app bundle injects via `LSEnvironment`
+   * (see {@link ghosttyHomeDir}) — set it, and the command drops the var again
+   * before the box starts.
+   *
+   * The variable is how the clone finds its config, but it is inherited by
+   * everything the terminal spawns, and plenty of tools key off it (`gh` reads
+   * `$XDG_CONFIG_HOME/gh/hosts.yml`, nvim its whole config) — inside the box
+   * they'd look in Ghostty's private home and find nothing. The reset is
+   * **conditional** on the value still being ours: `zsh -lic` loads the login
+   * profile first, so a user who exports their own `XDG_CONFIG_HOME` has
+   * already overwritten it by then and must keep it.
+   */
+  resetXdgConfigHome?: string | null;
 }
 
 /** Inputs for {@link buildGhosttyConfig} — a box command plus the app's looks. */
@@ -52,6 +66,55 @@ function shQuote(s: string): string {
 }
 
 /**
+ * Reject a config value that would break out of the single line / single
+ * statement it's interpolated into.
+ *
+ * Both generators here are line-oriented: a Ghostty config is `key = value` per
+ * line, and the shell command is one statement. A `\n` in a value is therefore
+ * not a quoting problem but a *syntax* one — `cwd` with a newline in it injects
+ * a second `command = …` into the app config (scalar keys: last wins, so it runs
+ * at every launch, outside the sandbox). Config values are author-controlled,
+ * and with box configs coming from repos (utils/trust.ts) "author" can mean
+ * "whoever wrote the repo", so this throws instead of silently escaping.
+ */
+export function assertSingleLine(value: string, what: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: that's the point
+  if (/[\r\n\0\x1b]/.test(value)) {
+    throw new Error(
+      `clabox: ${what} must not contain newlines or control characters (got ${JSON.stringify(value)})`,
+    );
+  }
+  return value;
+}
+
+/**
+ * What an `app.name` may be: a plain filename, since it becomes
+ * `<appsDir>/<name>.app` — a path `clabox init` `rm -rf`s and then clones
+ * Ghostty onto. Unvalidated, `path.join` happily resolves a `../../..` out of
+ * `appsDir` (`name: '../../../tmp/x'` deletes `/tmp/x.app`), and `name:
+ * 'Ghostty'` with `appsDir: '/Applications'` deletes the donor app itself. No
+ * separators, no `..`, no leading dot, no control characters; spaces and emoji
+ * are fine (`"AX Manager"` is a real app name).
+ */
+export function assertSafeAppName(name: string): string {
+  const bad =
+    !name ||
+    name === '.' ||
+    name === '..' ||
+    name.startsWith('.') ||
+    name.includes('/') ||
+    name.includes('\\') ||
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: filename guard
+    /[\0-\x1f:]/.test(name);
+  if (bad) {
+    throw new Error(
+      `clabox: unsafe app.name ${JSON.stringify(name)} — it names <appsDir>/<name>.app, so it must be a plain filename (no '/', no '..', no leading '.')`,
+    );
+  }
+  return name;
+}
+
+/**
  * The `zsh -lic '…'` shell command that boots clabox for the box — the value of
  * the Ghostty `command` key, and the same string the AppleScript surface
  * configuration takes (`sandbox/applescript.ts`), so a tab opened either way
@@ -63,11 +126,25 @@ function shQuote(s: string): string {
  * shebang is `#!/usr/bin/env node`).
  */
 export function buildShellCommand(opts: BoxCommandOptions): string {
+  for (const [what, value] of [
+    ['projectDir', opts.projectDir],
+    ['configsDir', opts.configsDir],
+    ['claboxBin', opts.claboxBin],
+    ['box name', opts.boxName],
+  ] as Array<[string, string | null]>) {
+    if (value) assertSingleLine(value, what);
+  }
+  const reset = opts.resetXdgConfigHome
+    ? `[ "$XDG_CONFIG_HOME" = ${shQuote(opts.resetXdgConfigHome)} ] && unset XDG_CONFIG_HOME; `
+    : '';
   const cd = opts.projectDir ? `cd ${shQuote(opts.projectDir)} && ` : '';
   const env = opts.configsDir ? `CLABOX_CONFIGS_DIR=${shQuote(opts.configsDir)} ` : '';
-  const box = opts.boxName ? ` -b ${opts.boxName}` : '';
+  // Quoted like every other interpolated value, even though `resolveBox`
+  // already restricts box names to a safe charset — a generator shouldn't rely
+  // on a check that lives two modules away.
+  const box = opts.boxName ? ` -b ${shQuote(opts.boxName)}` : '';
   const extra = (opts.extraArgs ?? []).map((a) => ` ${shQuote(a)}`).join('');
-  const inner = `${cd}${env}${shQuote(opts.claboxBin)}${box}${extra}; exec zsh`;
+  const inner = `${reset}${cd}${env}${shQuote(opts.claboxBin)}${box}${extra}; exec zsh`;
   // The whole thing is handed over inside single quotes, so a `'` anywhere in a
   // path or an extra arg would end the string early — close/escape/reopen it the
   // POSIX way instead.
@@ -113,6 +190,17 @@ export const GHOSTTY_APP_DEFAULTS: Record<string, string> = {
 /** Build the Ghostty config text for an app box. */
 export function buildGhosttyConfig(opts: GhosttyConfigOptions): string {
   const { app } = opts;
+  // Every value below ends up as a `key = value` line; a newline in one of them
+  // would add a line of its own (a second `command =` being the interesting
+  // case). Checked up front so the error names the field.
+  assertSafeAppName(app.name);
+  assertSingleLine(app.title ?? app.name, 'app.title');
+  if (app.macosIcon) assertSingleLine(app.macosIcon, 'app.macosIcon');
+  if (opts.baseGhosttyConfig) assertSingleLine(opts.baseGhosttyConfig, 'baseGhosttyConfig');
+  for (const [key, value] of Object.entries(app.ghostty ?? {})) {
+    assertSingleLine(key, 'app.ghostty key');
+    assertSingleLine(value, `app.ghostty['${key}']`);
+  }
   const lines: string[] = [
     '# Generated by `clabox init` — do not edit; rerun it after changing the box config.',
   ];
@@ -138,56 +226,78 @@ export function buildGhosttyConfig(opts: GhosttyConfigOptions): string {
   return `${lines.join('\n')}\n`;
 }
 
-/** Escape a string for embedding as a C double-quoted literal. */
-function cEscape(s: string): string {
-  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+/**
+ * The private `XDG_CONFIG_HOME` for a box's app: `<base>/ghostty-home/<box>`.
+ *
+ * This is how a clone gets its own config **without a launcher binary**. The
+ * obvious design — keep the real Ghostty as `ghostty.real` and make
+ * `CFBundleExecutable` a wrapper that re-execs it with `--config-file=…` — is
+ * what the builder used to do, and it quietly destroys the bundle's identity:
+ * LaunchServices keys its record on the running **executable path**, so when
+ * the image changes under it (even via `execv`, which keeps the pid) it moves
+ * the launch data to `originalExecutablePath`/`originalPid` and **clears the
+ * `pid` field**. `NSRunningApplication.processIdentifier` then returns `-1`,
+ * which breaks every consumer that goes bundle → pid → API: window managers
+ * (`AXUIElementCreateApplication(-1)` yields no windows, so Rectangle silently
+ * can't move the app's windows), AppleScript targeting, Dock integration, and
+ * TCC, which prompts against a signing identity that is no longer the bundle's
+ * (a wrapper leaves the real binary signed standalone, `Info.plist` not bound).
+ *
+ * Injecting the var via `LSEnvironment` keeps the shipped Ghostty binary as the
+ * bundle's one and only executable, so the process LaunchServices started is
+ * the process that keeps running.
+ */
+export function ghosttyHomeDir(baseDir: string, boxName: string): string {
+  return path.join(baseDir, 'ghostty-home', boxName);
+}
+
+/** The file Ghostty actually reads inside that home: `<home>/ghostty/config`. */
+export function ghosttyHomeConfigPath(home: string): string {
+  return path.join(home, 'ghostty', 'config');
 }
 
 /**
- * Build the C launcher source. It finds itself, locates `ghostty.real` next to
- * it, and re-execs it with `--config-file=<configPath>` prepended — so the clone
- * always boots with its own config regardless of how it's launched.
+ * Contents of that file: a one-line `config-file` pointing at the box's real
+ * generated config. Indirection on purpose — the box config stays at the
+ * familiar `<base>/ghostty/<box>.config` (where `+validate-config` checks it
+ * and a user can read it), and the XDG home holds nothing but the pointer.
  */
-export function buildLauncherSource(configPath: string): string {
-  return `// Generated by clabox init. Launches ghostty.real with a baked config.
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <libgen.h>
-#include <mach-o/dyld.h>
-
-static const char *CONFIG_PATH = "${cEscape(configPath)}";
-
-int main(int argc, char *argv[]) {
-    char path[4096];
-    uint32_t size = sizeof(path);
-    _NSGetExecutablePath(path, &size);
-
-    char *dir = dirname(path);
-    char real_path[4096];
-    snprintf(real_path, sizeof(real_path), "%s/ghostty.real", dir);
-
-    char config_arg[4096];
-    snprintf(config_arg, sizeof(config_arg), "--config-file=%s", CONFIG_PATH);
-
-    char **new_argv = malloc(sizeof(char *) * (argc + 2));
-    new_argv[0] = real_path;
-    new_argv[1] = config_arg;
-    for (int i = 1; i < argc; i++) new_argv[i + 1] = argv[i];
-    new_argv[argc + 1] = NULL;
-
-    execv(real_path, new_argv);
-    return 1;
-}
-`;
+export function buildHomeConfigShim(configPath: string): string {
+  return [
+    '# Generated by `clabox init` — do not edit; rerun it after changing the box config.',
+    '# Ghostty reads this because the .app injects XDG_CONFIG_HOME via LSEnvironment.',
+    `config-file = ${configPath}`,
+    '',
+  ].join('\n');
 }
 
-/** Absolute path to the built `.app` bundle. */
+/**
+ * Absolute path to the built `.app` bundle — validated to stay inside
+ * `appsDir`, since the builder `rm -rf`s this path before cloning onto it.
+ */
 export function appBundlePath(appsDir: string, app: AppConfig): string {
-  return path.join(appsDir, `${app.name}.app`);
+  assertSafeAppName(app.name);
+  const dir = path.resolve(appsDir);
+  const out = path.resolve(dir, `${app.name}.app`);
+  // Belt and braces: the name check above already rules out separators, so a
+  // failure here means someone found a form it doesn't cover.
+  if (path.dirname(out) !== dir) {
+    throw new Error(`clabox: app bundle path escapes appsDir: ${out}`);
+  }
+  return out;
 }
 
-/** Bundle identifier for the clone (explicit, or derived from the box name). */
+/**
+ * Bundle identifier for the clone (explicit, or derived from the box name).
+ * Restricted to the reverse-DNS charset: it's written into `Info.plist` and is
+ * the key every LaunchServices / TCC record hangs off.
+ */
 export function bundleId(boxName: string, app: AppConfig): string {
-  return app.bundleId ?? `com.ghostty.custom.${boxName.replace(/-/g, '.')}`;
+  const id = app.bundleId ?? `com.ghostty.custom.${boxName.replace(/-/g, '.')}`;
+  if (!/^[A-Za-z0-9.-]+$/.test(id)) {
+    throw new Error(
+      `clabox: unsafe bundle id ${JSON.stringify(id)} — use letters, digits, '.' and '-' only`,
+    );
+  }
+  return id;
 }

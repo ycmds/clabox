@@ -1,16 +1,18 @@
 // I/O for the `clabox init` Ghostty-app builder (macOS-only).
 //
-// Clones Ghostty.app into `<appsDir>/<name>.app`, swaps the binary for a tiny
-// compiled launcher that bakes in `--config-file=<config>`, sets the icon,
-// disables Sparkle, and re-signs. Mirrors the old ghostty-app-builder.sh. The
-// pure text builders live in init/ghostty.ts.
+// Clones Ghostty.app into `<appsDir>/<name>.app`, points it at the box's config
+// through a private `XDG_CONFIG_HOME` in `LSEnvironment`, sets the icon,
+// disables Sparkle, and re-signs. The donor's binary is kept as the bundle's
+// executable — see init/ghostty.ts#ghosttyHomeDir for why swapping it for a
+// launcher wrapper breaks the bundle's identity. The pure text builders live in
+// init/ghostty.ts.
 
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { type AppBuilderConfig, type AppConfig, expandHome } from '../utils/config.js';
-import { appBundlePath, buildLauncherSource, bundleId } from './ghostty.js';
+import { appBundlePath, bundleId } from './ghostty.js';
 
 /** Inputs for {@link buildApp}. */
 export interface BuildAppOptions {
@@ -18,8 +20,12 @@ export interface BuildAppOptions {
   boxName: string;
   app: AppConfig;
   builder: AppBuilderConfig;
-  /** Absolute path to the already-written Ghostty config to bake in. */
-  configPath: string;
+  /**
+   * Absolute path to the box's private XDG home (see
+   * `init/ghostty.ts#ghosttyHomeDir`), injected as `XDG_CONFIG_HOME` so the
+   * clone reads `<home>/ghostty/config` instead of the user's own.
+   */
+  xdgConfigHome: string;
 }
 
 /** Result of a successful {@link buildApp}. */
@@ -32,23 +38,31 @@ function run(cmd: string, args: string[]): void {
   execFileSync(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] });
 }
 
-function has(bin: string): boolean {
-  try {
-    execFileSync('command', ['-v', bin], { shell: '/bin/sh', stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** True when the host can build apps (macOS with the donor app + a C compiler). */
 export function canBuildApps(builder: AppBuilderConfig): { ok: boolean; reason?: string } {
   if (process.platform !== 'darwin') return { ok: false, reason: 'not macOS' };
   if (!fs.existsSync(expandHome(builder.ghosttyApp))) {
     return { ok: false, reason: `Ghostty not found at ${builder.ghosttyApp}` };
   }
-  if (!has('cc')) return { ok: false, reason: 'no C compiler (cc) — install Xcode CLT' };
   return { ok: true };
+}
+
+/**
+ * The user's own macOS Ghostty config, which competes with the one we inject.
+ *
+ * Ghostty looks for its config in `$XDG_CONFIG_HOME/ghostty/config` and, on
+ * macOS, in `~/Library/Application Support/com.mitchellh.ghostty/config` —
+ * and the Application Support path is hard-coded to the upstream bundle id, so
+ * a clone can't get its own. Returns the path when it exists and is non-empty,
+ * else null; the caller turns that into a warning rather than a failure.
+ */
+export function conflictingUserConfig(): string | null {
+  const p = expandHome('~/Library/Application Support/com.mitchellh.ghostty/config');
+  try {
+    return fs.statSync(p).size > 0 ? p : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -167,13 +181,22 @@ export function installIcon(app: AppConfig, appPath: string, tmpDir: string): vo
  * decides whether to abort or carry on with the other boxes).
  */
 export function buildApp(opts: BuildAppOptions): BuildAppResult {
-  const { app, builder, boxName, configPath } = opts;
+  const { app, builder, boxName, xdgConfigHome } = opts;
   const check = canBuildApps(builder);
   if (!check.ok) throw new Error(`cannot build app: ${check.reason}`);
 
-  const ghosttyApp = expandHome(builder.ghosttyApp);
+  const ghosttyApp = path.resolve(expandHome(builder.ghosttyApp));
   const appsDir = expandHome(builder.appsDir);
+  // Throws unless `<name>.app` resolves to a direct child of appsDir — the path
+  // below is `rm -rf`'d and then cloned onto, so a traversing `app.name` would
+  // delete an arbitrary directory (`appBundlePath` has the details).
   const appPath = appBundlePath(appsDir, app);
+  // …and never let the clone land on its own donor: `name: 'Ghostty'` with the
+  // default `appsDir: '/Applications'` would otherwise delete Ghostty.app in
+  // step one and copy from a path that no longer exists in step two.
+  if (appPath === ghosttyApp) {
+    throw new Error(`clabox: app.name '${app.name}' would overwrite the donor app (${ghosttyApp})`);
+  }
   // Build into a staging clone next to the final bundle (same filesystem → the
   // final rename is atomic) and only swap it in once every step has succeeded.
   // A failed build (e.g. an unreadable donor) must never destroy an existing
@@ -196,6 +219,19 @@ export function buildApp(opts: BuildAppOptions): BuildAppResult {
     run('plutil', ['-replace', 'CFBundleDisplayName', '-string', app.name, plist]);
     run('plutil', ['-replace', 'CFBundleExecutable', '-string', 'ghostty', plist]);
 
+    // Point the clone at its own config without touching its executable: macOS
+    // exports LSEnvironment into every app it launches through LaunchServices
+    // (Dock, Finder, `open`, Raycast), and Ghostty reads
+    // `$XDG_CONFIG_HOME/ghostty/config`. The generated `command` drops the var
+    // again before the box starts — see ghostty.ts#resetXdgConfigHome.
+    run('plutil', [
+      '-replace',
+      'LSEnvironment',
+      '-json',
+      JSON.stringify({ XDG_CONFIG_HOME: xdgConfigHome }),
+      plist,
+    ]);
+
     // Disable Sparkle auto-update (would clobber the clone).
     run('plutil', ['-replace', 'SUEnableAutomaticChecks', '-bool', 'NO', plist]);
     try {
@@ -204,22 +240,16 @@ export function buildApp(opts: BuildAppOptions): BuildAppResult {
       // donor app may not define SUFeedURL — ignore
     }
 
-    // Swap the binary for a launcher that prepends --config-file.
-    const bin = path.join(stagePath, 'Contents', 'MacOS', 'ghostty');
-    fs.renameSync(bin, `${bin}.real`);
-    const src = path.join(tmpDir, 'launcher.c');
-    fs.writeFileSync(src, buildLauncherSource(configPath));
-    run('cc', ['-o', bin, src]);
-
     installIcon(app, stagePath, tmpDir);
 
-    // Re-sign: inner real binary first, then the whole bundle. (The signature
-    // seals the bundle contents, not its directory name, so the rename below
-    // keeps it valid.)
+    // Re-sign the bundle as a whole, so its executable stays the sealed main
+    // binary with the Info.plist bound into its signature — that binding is
+    // what gives the clone a real identity for TCC and LaunchServices. (The
+    // signature seals the bundle contents, not its directory name, so the
+    // rename below keeps it valid.)
     const signId = builder.signId;
     const entArgs = entitlements ? ['--entitlements', entitlements] : [];
     const idArgs = signId ? ['--sign', signId] : ['--sign', '-'];
-    run('codesign', ['--force', ...idArgs, ...entArgs, `${bin}.real`]);
     run('codesign', ['--force', '--deep', ...idArgs, ...entArgs, stagePath]);
 
     // Everything succeeded — atomically replace the previous bundle.

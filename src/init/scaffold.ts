@@ -15,8 +15,14 @@ import {
   resolveBox,
 } from '../utils/config.js';
 import { buildAliasFiles } from './aliases.js';
-import { buildApp, canBuildApps, validateGhosttyConfig } from './app.js';
-import { appBundlePath, buildGhosttyConfig } from './ghostty.js';
+import { buildApp, canBuildApps, conflictingUserConfig, validateGhosttyConfig } from './app.js';
+import {
+  appBundlePath,
+  buildGhosttyConfig,
+  buildHomeConfigShim,
+  ghosttyHomeConfigPath,
+  ghosttyHomeDir,
+} from './ghostty.js';
 import { buildRaycastCommand } from './raycast.js';
 
 /**
@@ -50,6 +56,14 @@ function pruneByExt(dir: string, ext: string): void {
   if (!fs.existsSync(dir)) return;
   for (const f of fs.readdirSync(dir)) {
     if (f.endsWith(ext)) fs.rmSync(path.join(dir, f), { force: true });
+  }
+}
+
+/** Remove every per-box XDG home under `dir` (a no-op if dir is absent). */
+function pruneDirs(dir: string): void {
+  if (!fs.existsSync(dir)) return;
+  for (const f of fs.readdirSync(dir)) {
+    fs.rmSync(path.join(dir, f), { recursive: true, force: true });
   }
 }
 
@@ -103,6 +117,14 @@ export interface InitOptions {
   buildApps?: boolean;
   /** Limit app building to a single box (by box name or app display name). */
   only?: string | null;
+  /**
+   * Accept configs that aren't trusted (`--trust`). `init` `import()`s **every**
+   * box config under `<dir>/configs` — including with `--no-apps`, which only
+   * skips the app build — so pointing it at a cloned repo is arbitrary code
+   * execution outside any sandbox. The gate itself lives in `loadConfig`; this
+   * only forwards the override. See utils/trust.ts.
+   */
+  trust?: boolean;
 }
 
 /** A standalone Ghostty app built by `clabox init`. */
@@ -122,6 +144,8 @@ export interface InitResult {
   apps: BuiltApp[];
   /** Generated Ghostty config files. */
   ghosttyConfigs: string[];
+  /** Per-box private `XDG_CONFIG_HOME` dirs injected into the app bundles. */
+  ghosttyHomes: string[];
   /** Generated Raycast command scripts. */
   raycastCommands: string[];
   /** Compiled per-box MCP json files (from `config.mcp`). */
@@ -139,10 +163,11 @@ async function materializeExtras(
   configsDir: string,
   profiles: string[],
   result: InitResult,
+  trust: boolean,
 ): Promise<void> {
   for (const name of profiles) {
     try {
-      const { config } = await loadConfig(resolveBox(name, configsDir));
+      const { config } = await loadConfig(resolveBox(name, configsDir), { trust });
       for (const f of buildBoxExtras(config, name).files) {
         fs.mkdirSync(path.dirname(f.path), { recursive: true });
         // 0600 — the MCP json can carry an auth token (see run.ts#writeExtraFiles).
@@ -163,11 +188,12 @@ async function buildAppArtifacts(
   profiles: string[],
   only: string | null,
   result: InitResult,
+  trust: boolean,
 ): Promise<void> {
   // Load each box config; keep the ones that opt into an app (and match `only`).
   const appBoxes: { name: string; config: Config }[] = [];
   for (const name of profiles) {
-    const { config } = await loadConfig(resolveBox(name, configsDir));
+    const { config } = await loadConfig(resolveBox(name, configsDir), { trust });
     if (!config.app) continue;
     if (only && name !== only && config.app.name !== only) continue;
     appBoxes.push({ name, config });
@@ -182,6 +208,18 @@ async function buildAppArtifacts(
   if (!only) {
     pruneByExt(ghosttyDir, '.config');
     pruneByExt(raycastDir, '.sh');
+    pruneDirs(path.join(base, 'ghostty-home'));
+  }
+
+  // Ghostty prefers `~/Library/Application Support/com.mitchellh.ghostty/config`
+  // over the XDG path when both are non-empty, and that path is hard-coded to
+  // the upstream bundle id — so a user config there would shadow everything we
+  // inject into the clones.
+  const userConfig = conflictingUserConfig();
+  if (userConfig) {
+    result.warnings.push(
+      `${userConfig} may shadow the generated app configs — move it to ~/.config/ghostty/config`,
+    );
   }
 
   for (const { name, config } of appBoxes) {
@@ -192,6 +230,7 @@ async function buildAppArtifacts(
     const baseGhostty = config.appBuilder.baseGhosttyConfig
       ? expandHome(config.appBuilder.baseGhosttyConfig)
       : null;
+    const xdgHome = ghosttyHomeDir(base, name);
     fs.writeFileSync(
       configPath,
       buildGhosttyConfig({
@@ -201,9 +240,17 @@ async function buildAppArtifacts(
         configsDir: bakeConfigsDir(configsDir),
         claboxBin: resolveClaboxBin(config.appBuilder.claboxBin),
         baseGhosttyConfig: baseGhostty,
+        resetXdgConfigHome: xdgHome,
       }),
     );
     result.ghosttyConfigs.push(configPath);
+
+    // The private XDG home the bundle points at — nothing but a pointer back to
+    // the config we just wrote (see ghostty.ts#ghosttyHomeDir).
+    const homeConfig = ghosttyHomeConfigPath(xdgHome);
+    fs.mkdirSync(path.dirname(homeConfig), { recursive: true });
+    fs.writeFileSync(homeConfig, buildHomeConfigShim(configPath));
+    result.ghosttyHomes.push(xdgHome);
 
     // Ask the real Ghostty whether it actually understands what we just wrote —
     // it ignores unknown keys silently, so a typo in `app.ghostty` would only
@@ -226,7 +273,12 @@ async function buildAppArtifacts(
       continue;
     }
     try {
-      const built = buildApp({ boxName: name, app, builder: config.appBuilder, configPath });
+      const built = buildApp({
+        boxName: name,
+        app,
+        builder: config.appBuilder,
+        xdgConfigHome: xdgHome,
+      });
       result.apps.push({ box: name, appPath: built.appPath, signed: built.signed });
     } catch (e) {
       result.warnings.push(`${name}: app build failed — ${(e as Error).message}`);
@@ -239,6 +291,7 @@ export async function runInit({
   baseDir,
   buildApps = true,
   only = null,
+  trust = false,
 }: InitOptions = {}): Promise<InitResult> {
   const base = path.resolve(baseDir ?? defaultBaseDir());
   const configsDir = path.join(base, 'configs');
@@ -261,15 +314,16 @@ export async function runInit({
     written: files.map((f) => f.path),
     apps: [],
     ghosttyConfigs: [],
+    ghosttyHomes: [],
     raycastCommands: [],
     extraFiles: [],
     warnings: [],
   };
 
-  await materializeExtras(configsDir, profiles, result);
+  await materializeExtras(configsDir, profiles, result, trust);
 
   if (buildApps) {
-    await buildAppArtifacts(base, configsDir, profiles, only, result);
+    await buildAppArtifacts(base, configsDir, profiles, only, result, trust);
   }
   return result;
 }
