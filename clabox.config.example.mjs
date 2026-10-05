@@ -46,6 +46,41 @@ export default {
   // Set true only for a box you'd be happy to run unsandboxed.
   allowBackgroundTasks: false,
 
+  // `/usr/bin/open` + Launch Services — the OTHER sandbox ESCAPE HATCH, also
+  // off by default. `open` forks nothing in-box: it asks LaunchServices (which
+  // runs outside every sandbox) to start a target, and the target comes up
+  // under launchd with NO profile. Since the box can write `.app` bundles into
+  // /tmp, $TMPDIR and the project, granting this is arbitrary code execution as
+  // you — and unlike background tasks it needs no running daemon.
+  allowOpen: false,
+
+  // The opener BROKER — the safe slice of `open`, without the escape above.
+  // Run ONE broker outside the sandbox (`clabox opener --detach`) and every box
+  // can ask it: `clabox reveal <dir>` shows a folder in Finder, `clabox open
+  // <file>` opens a file in your editor. A box sends a PATH and nothing else —
+  // no flags, no choice of application — and `reveal` is always `open -R`,
+  // which never launches anything.
+  //
+  // You normally need NOTHING here: every box may reach the broker, the default
+  // roots are `[$HOME]`, and the app is picked per file type from what you have
+  // installed (code → Zed/Cursor/VS Code/…, a vault note → Obsidian, an image →
+  // Preview, folders → Finder).
+  // Set the policy where you start the broker (`--root`, `--editor`) or in the
+  // global ~/.config/clabox/config.mjs. This block is for narrowing it:
+  // opener: {
+  //   enabled: false,                // this box may not talk to the broker
+  //   editor: 'Obsidian',            // broker-side: app for `clabox open`
+  //   roots: ['~/vault'],            // broker-side: default is [$HOME]
+  //   maxPerMinute: 12,
+  // },
+
+  // Grant claude's daemon socket (`/tmp/cc-daemon-<uid>`), which Remote Control
+  // (`/rc`) talks over. The `--rc` CLI flag sets this per launch, so you rarely
+  // need it here. Not an escape by itself, but it is the channel to the one
+  // process that can re-host this session without a profile — so a box that
+  // never uses `/rc` doesn't get it.
+  remoteControl: false,
+
   // Fork-bomb guard: how many processes the box may add ON TOP of what this
   // user already runs (macOS counts RLIMIT_NPROC per uid, machine-wide, so an
   // absolute cap below the current count would make every fork in the box fail
@@ -62,11 +97,47 @@ export default {
   // },
 
   // Extra rules layered on top of the base profile.
+  //
+  // One entry per PATH, its value the rights it carries:
+  //   r = read   (contents + metadata)
+  //   w = write  (and read with it — a writable path is readable)
+  //   s = stat   ONLY: existence, size, mode, mtime. No contents, no listing.
+  //              The profile grants no metadata globally, so this is how a path
+  //              whose contents must stay denied still becomes stat-able. The
+  //              hard secret deny still wins, so it can't uncover ~/.ssh/id_*.
+  //   e = exec   (process-exec — orthogonal to the three above)
+  //   c = connect to the unix socket at this path. Also orthogonal: a socket
+  //              connect is networking, not file I/O, so 'r'/'w' never grant it
+  //              and a file deny never takes it away. Sockets are DENIED by
+  //              default — this is the opt-in (docker.sock, an ssh-agent, …).
+  //   d = deny   read + write + stat + connect. Exclusive: 'rd' throws.
+  // Narrowest first, each wider right implies the ones below: 'w' ≡ 'rw'.
+  // Write 'rw', ['r','w'] or ['read','write'] — whichever reads better.
   paths: {
-    readWrite: [], // e.g. ['~/scratch', '/Volumes/work']
-    readOnly: [], // e.g. ['~/reference-data', '~/some/hooks']
-    exec: [], // e.g. ['/opt/some/tool/bin', '~/some/hooks'] (so hooks can run)
-    deny: [], // e.g. ['~/secret-project'] (subpath deny, read + write)
+    // '~/scratch': 'w',                   // read + write
+    // '~/reference-data': 'r',            // read-only
+    // '~/some/hooks': 're',               // read + exec, so a hook can run
+    // '~/Library/Group Containers': 's',  // it exists, nothing more
+    // '/var/run/docker.sock': 'c',        // may talk to this socket
+    // '~/secret-project': 'd',            // denied outright
+    //
+    // In a box that builds on a preset, this form removes the per-class
+    // spreading:
+    //   paths: { ...presets.root.paths, '~/scratch': 'w' }
+    // instead of spreading readOnly / readWrite / exec one by one. The outer
+    // `...preset.paths` is still required — spreading a preset inside a config
+    // file is plain JS, so `paths:` replaces the preset's object; clabox only
+    // deep-merges the defaults with this file.
+    //
+    // The original per-class spelling still works, and mixes freely with the
+    // above: read / write / stat / exec / deny (+ the older aliases readOnly =
+    // read, readWrite = write).
+    // read: ['~/reference-data'],
+    // write: ['~/scratch'],
+    // stat: ['/Applications'],
+    // exec: ['/opt/some/tool/bin'],
+    // socket: ['/var/run/docker.sock'],
+    // deny: ['~/secret-project'],
 
     // gitignore-style READ-deny, matched at any depth INSIDE the project dir.
     // `!` re-allows and last match wins, exactly like .gitignore, so order
@@ -74,6 +145,17 @@ export default {
     // shadow system runtimes granted earlier and break them). Empty by default;
     // e.g. hide every `.env*` secret but keep the `.env.example` template.
     denyGlobs: [], // e.g. ['**/.env*', '!**/.env.example', '**/___*']
+
+    // gitignore-style WRITE-deny, same matching rules — but this one ships a
+    // non-empty default, because each path in it is executed OUTSIDE the box
+    // later on, which would turn a write inside the box into code running as
+    // you: `clabox.config.*` is imported by the next clabox run (before any
+    // profile exists), `.git/config` carries core.pager / fsmonitor /
+    // sshCommand / hooksPath (commands git runs on your next `git log`),
+    // `.git/hooks` likewise, and `.envrc` is run by direnv just for `cd`-ing in.
+    // The box still READS all of them. Override only if you need it — e.g.
+    // `git worktree add` / `git remote add` write `.git/config` and will fail.
+    // denyWriteGlobs: ['**/clabox.config.*', '**/.git/config', '**/.git/hooks', '**/.envrc'],
   },
 
   // Home subdirectories denied entirely (read + write).

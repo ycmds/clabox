@@ -17,6 +17,8 @@
 **🛡️ Tight Seatbelt sandbox** — the profile starts with `(deny default)` <br/>
 **📂 Project-scoped access** — only the CWD and explicitly allowed paths <br/>
 **🔒 Secrets stay out of reach** — SSH keys, `~/.aws`, `~/.ssh/id_*`, private dirs <br/>
+**🚪 Escape hatches are opt-in** — background tasks, `open`, the daemon socket: all off by default <br/>
+**🔎 Brokered `open`** — the agent can ask you to reveal a folder / open a file, without the escape <br/>
 **📦 Declarative JS config** instead of sed surgery over a heredoc <br/>
 **🤖 Bot identity** for git/ssh inside the sandbox <br/>
 **🧨 Fork-bomb guard** via `ulimit -u` (headroom over the running process count) <br/>
@@ -59,8 +61,19 @@ clabox -b ax-mg -e GH_TOKEN=ghp_…        # this tab only
 # Open a box in the terminal you're already in (Ghostty)
 clabox -b ax-mg tab --split right
 
+# Let the agent show you things without granting it `open` (see Opener broker)
+clabox opener --detach            # one broker, outside the sandbox, serves every box
+clabox reveal .                   # from ANY box: show this folder in Finder
+clabox open ./notes/today.md      # from ANY box: open a file in your editor
+
+# A config that isn't under ~/.config/clabox has to be trusted first (it's code
+# clabox runs OUTSIDE the sandbox) — see Configuration
+clabox trust ./clabox.config.mjs
+clabox trust --list
+
 # Debugging
-clabox generate            # build the profile, print the .sb path
+clabox info                # version, box, grants, escape hatches, trust state
+clabox generate            # materialize the profile, print the .sb path
 clabox profile             # just the path (no build)
 CLABOX_DEBUG=1 clabox      # print profile/config/dir on launch
 clabox --help
@@ -101,6 +114,25 @@ export default {
 
 You may also export a function `(defaults) => config` for full control. `~` is
 expanded to `$HOME`.
+
+#### A config file is code — so it has to be trusted
+
+clabox `import()`s the config **before** the sandbox exists: its top-level code
+runs as you, and what it returns *is* the sandbox policy. A config under
+`~/.config/clabox` is trusted by location (that tree is read-only inside every
+box). Anything else — a repo's `./clabox.config.mjs`, `-b ./boxes/vibe.mjs`,
+`clabox init --dir <repo>` — has to be recorded first:
+
+```bash
+clabox trust ./clabox.config.mjs   # record it (by content hash)
+clabox trust --list               # what's recorded (⚠️ = edited since)
+clabox --trust -b ./boxes/vibe.mjs # accept it for one run instead
+```
+
+The record is keyed by the file's **content**, so an edit — by you or by an
+agent that can write that repo — needs a fresh `clabox trust`. A config that
+lives inside a tree the box it configures can *write* is refused outright, even
+when trusted: the agent could otherwise widen its own sandbox for the next run.
 
 ### Named boxes (`-b` / `--box`)
 
@@ -271,6 +303,75 @@ for it is your shell rc:
 clabox -b ax daemon --detach >/dev/null 2>&1
 ```
 
+### Opener broker — `open` without the escape
+
+A box cannot run `open`: it hands a path to LaunchServices, which starts the
+target **outside** every sandbox with no profile, and the box can write the
+`.app` it would point at. But "show me this folder" and "open this file in my
+editor" don't need that power — so clabox brokers them.
+
+Start one broker, outside the sandbox — it serves every box:
+
+```bash
+clabox opener --detach                       # that's it — the app is chosen per file type
+clabox opener --root ~/vault --editor Zed --detach   # …or pin the policy yourself
+```
+
+Which app opens what, with no configuration: code and text go to the best
+editor you have installed (Zed → Cursor → VS Code → Sublime → …), markdown to
+a reader instead (Typora → MacDown → Marked 2, since opening a doc means you
+want to *read* it) — unless it sits inside an Obsidian vault, which goes to
+Obsidian — images and PDFs to Preview, folders to Finder. Each branch falls
+back to the next when the app isn't installed. `--editor` overrides all of it,
+and the broker always reports what it used (`ok: Typora`).
+
+Nothing to configure per box: every box may reach the broker (and the socket
+only exists while you're running one). A box can opt out with
+`opener: { enabled: false }`, and the policy can live in your global
+`~/.config/clabox/config.mjs` instead of the flags.
+
+Then, inside any box:
+
+```bash
+clabox reveal .                  # Finder, via `open -R`
+clabox open ./notes/today.md     # the editor from the config
+```
+
+For typing it by hand there are generated shell helpers, written next to the
+socket and printed when the broker starts:
+
+```bash
+source ~/.config/clabox/opener/claude-aliases.sh
+
+o .              # folder → Finder
+o ./README.md    # file → the right app for its type
+c ./src          # VS Code if you have it, else the same routing
+```
+
+Inside a box they write one line to the broker's socket with `nc` — no `clabox`
+process, so nothing beyond the socket grant is needed.
+
+They exist because the one-liner everyone writes first is wrong: `clabox open`
+refuses a *directory* (no extension in the allowlist), so a folder has to go to
+`reveal`; a URL can't go to the broker at all; and outside a box the native
+`open` is still what you want. The file is POSIX shell functions — not aliases,
+since claude's `!` bash mode runs a non-interactive shell where aliases don't
+expand — and it is rewritten on every broker start, so keep your own additions
+in the rc that sources it.
+
+The agent sends a **path and nothing else**: no flags, no choice of application,
+a closed two-verb vocabulary. `reveal` is `open -R`, which per `man open`
+"reveals the file(s) in the Finder *instead of opening them*" — it cannot launch
+anything. Paths are realpath'd, must land inside `roots`, may not touch an
+`.app` bundle, and `edit` is limited to text extensions. Requests are
+rate-limited and logged to `~/.config/clabox/opener/opener.log` — the
+broker keeps its socket, pid file and log together in that one directory.
+
+One thing to know: an editor can execute what it opens (Obsidian runs vault
+plugins and `dataviewjs`, VS Code has tasks). The broker doesn't create that —
+the agent already writes those files and you already open them — but it does let
+the agent pick the moment, which is why `editor` defaults to null.
+
 ### Environment variables
 
 | Variable | Purpose | Default |
@@ -292,8 +393,11 @@ clabox -b ax daemon --detach >/dev/null 2>&1
 | `CLABOX_STRICT_MCP` | `0` drops `--strict-mcp-config` (`config.strictMcp`) so the claude.ai cloud connectors stay | strict |
 | `CLABOX_NOTIFY` | `1` enables in-sandbox notifications (`config.notify`) | off |
 | `CLABOX_NOTIFY_TITLE` | banner title for those notifications | `Claude · <box>` |
+| `CLABOX_ALLOW_BACKGROUND_TASKS` | `1` allows claude's background tasks — **an escape**: they run outside the sandbox | off |
+| `CLABOX_ALLOW_OPEN` | `1` allows `open` / Launch Services — **an escape**: it starts processes outside the sandbox | off |
+| `CLABOX_REMOTE_CONTROL` | `1` grants claude's daemon socket (what `/rc` uses); `--rc` sets it per launch | off |
+| `CLABOX_TRUST` | `1` loads an untrusted / box-writable config file (same as `--trust`) | off |
 | `CLABOX_DEBUG` | print diagnostics on launch | — |
-| `TMPDIR` | where the generated profile is stored | `/tmp` |
 
 ---
 
@@ -303,19 +407,27 @@ clabox -b ax daemon --detach >/dev/null 2>&1
 `(deny default)` — everything is forbidden unless explicitly allowed.
 
 ```
-clabox run  →  loadConfig()  →  buildProfile()  →  <TMPDIR>/…sb
-            →  sh -c 'ulimit -u N; exec sandbox-exec -f <sb> env … claude …'
+clabox run  →  loadConfig()  →  trust gate  →  buildProfile()  →  SBPL text
+            →  sh -c 'ulimit -u N; exec sandbox-exec -p <profile> env … claude …'
 ```
+
+The profile is passed **inline**, not through a file: the old
+`$TMPDIR/clabox-<dir>-<hash>.sb` sat in a directory the box itself can write, so
+a box could rewrite its own policy between the write and the launch. `clabox
+generate` still materializes a copy to read, under `~/.config/clabox/profiles/`
+(read-only inside the box, `0600` on disk).
 
 | Module | Responsibility |
 |---|---|
 | `src/utils/config.ts` | defaults, env, loading/merging the JS config, `~` expansion |
 | `src/sandbox/profile.ts` | assembling the SBPL profile from config (typed helpers `subpath`/`literal`/`regex`/…) |
 | `src/sandbox/run.ts` | locating `claude`/`sandbox-exec`, generating the profile, launching with bot env + `ulimit` |
-| `src/cli.ts` | the CLI (`run` / `generate` / `profile`), built on yargs |
+| `src/utils/trust.ts` | the trust gate for config files clabox `import()`s outside the sandbox |
+| `src/cli.ts` | the CLI (`run` / `generate` / `profile` / `info` / `init` / `daemon` / `tab` / `trust`), built on yargs |
 
-Profile path: `$TMPDIR/clabox-<dir-name>-<hash>.sb` (hash of the absolute
-project path — each project gets its own cached profile).
+Generated-profile path (for `clabox generate` / `clabox info`):
+`~/.config/clabox/profiles/clabox-<dir-name>-<hash>.sb` (hash of the absolute
+project path — one per project).
 
 Package managers are autodetected (`src/sandbox/profile.ts`) and added to the
 read/exec sections: Homebrew (`/opt/homebrew` or `/usr/local/Homebrew`),
@@ -331,15 +443,29 @@ read/exec sections: Homebrew (`/opt/homebrew` or `/usr/local/Homebrew`),
 `/tmp`, `/private/tmp`, `/private/var/folders/…`, `~/Library/Keychains` (for
 OAuth refresh), plus `paths.readWrite` from your config.
 
-**Network:** `(allow network*)` when `network: true` (the default).
+**Network:** with `network: true` (the default) the profile grants IP in and
+out by address family — `(allow network-outbound (remote ip))`,
+`network-inbound`/`network-bind` on `(local ip)` — and **never** the blanket
+`(allow network*)`. In Seatbelt a unix-socket `connect(2)` is `network-outbound`
+with a path filter, so the blanket form used to hand every box every socket on
+the machine (an ssh-agent can sign as you; `docker.sock` is root on the host).
+Unix sockets are now opt-in per path — `paths.socket`, the per-path `'c'` right,
+or `--socket <path>` — with only the system resolver allowed by default.
 
 **Explicit deny — wins even over the allows above:**
 - private dirs: `denyHome` (`~/Documents`, `~/Desktop`, `~/Downloads`,
   `~/Pictures`, `~/Movies`, `~/Music`);
 - secrets: `denyDotConfigs` (`~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`,
   `~/.config`) with a carve-out for `~/.config/git`;
-- personal SSH keys `~/.ssh/id_*`, `*.pem`, `*.key` — Claude physically cannot
-  read them. Only the bot key subdir (`bot.sshDir`) is readable.
+- personal SSH keys `~/.ssh/id_*`, `*.pem`, `*.key` — no grant can re-expose
+  them, because this tier is emitted after every allow. Only the bot key subdir
+  (`bot.sshDir`) is readable.
+
+**Write-denied inside the project** (`paths.denyWriteGlobs`, on by default):
+`clabox.config.*`, `.git/config`, `.git/hooks`, `.envrc`. The box reads them and
+cannot change them — each one is executed *outside* the sandbox later (by the
+next `clabox` run, by your next `git` command, by direnv), which would turn a
+write inside the box into code running as you.
 
 ### Git/ssh bot identity
 
@@ -380,6 +506,31 @@ The suite tests the wrapper, not `claude`:
 - **Keychain is writable** for OAuth refresh (otherwise tokens hit 401 after
   ~24h). For a stricter setup, swap the RW Keychain block for RO in
   `src/sandbox/profile.ts` (the "Keychain access" section).
+
+### What clabox does and doesn't protect against
+
+clabox is built to contain **accidents and casual snooping**: a YOLO-mode agent
+that deletes the wrong directory, wanders into `~/Documents`, or reads a key it
+had no business reading. Those it stops, and the deny tiers are tested against a
+real `sandbox-exec`.
+
+It is **not a container**, and against a deliberately hostile agent the
+following remain true:
+
+- **It can read its own session token.** `security find-generic-password -s
+  "Claude Code-credentials"` works inside the box (claude has to refresh that
+  token), and outbound IP is granted — so treat the box as something that holds
+  a live credential for *its own* account.
+- **Opt-in escapes are escapes.** `allowBackgroundTasks` and `allowOpen` hand
+  work to processes that carry no Seatbelt profile. Both are off by default, and
+  `clabox info` prints whichever a box turned on in its `escapes` row.
+- **The project dir is code you'll run later.** The agent writes it; your next
+  `npm test`, `make`, or editor task runs it. The write-deny globs cover the
+  paths that execute by convention outside the box, but reviewing the diff is
+  still the real control.
+
+See [docs/guideline.md](docs/guideline.md#residual-risks--what-a-box-can-still-do)
+for the full list.
 
 ---
 
