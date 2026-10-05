@@ -23,5 +23,5 @@
   "javascript": {
     "formatter": { "quoteStyle": "single", "semicolons": "always" }
   },
-  "files": { "includes": ["src/**/*.ts", "tests/**/*.ts"] }
+  "files": { "includes": ["src/**/*.ts", "tests/**/*.ts", "!__"] }
 }

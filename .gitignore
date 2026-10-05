@@ -8,5 +8,7 @@ coverage/
 .DS_Store
 **/__*
 scripts
+configs
+configs2
 # internal working notes — not published, not tracked
 docs/internal/
