@@ -97,9 +97,11 @@ const baseData: InfoData = {
   box: null,
   slug: 'proj',
   projectDir: '/proj',
-  profileFile: '/tmp/clabox-proj-abcd1234.sb',
+  profileFile: '/cfg-home/profiles/clabox-proj-abcd1234.sb',
   profileExists: false,
   configFile: null,
+  configTrust: null,
+  escapeHatches: [],
   configDir: '/cfg',
   network: true,
   ulimitProcs: 1024,
@@ -117,6 +119,7 @@ const baseData: InfoData = {
   extraArgs: [],
   extraFiles: [],
   processEnv: [],
+  procTools: [],
 };
 
 describe('formatInfo', () => {
@@ -128,14 +131,44 @@ describe('formatInfo', () => {
     }
   });
 
-  test('shows version, the resolved self-path, claude bin, box=(none), not-built marker', () => {
+  test('reports the de-privileged tool copies the box runs instead of setuid ones', () => {
+    expect(formatInfo(baseData)).toContain('procTools       (none)');
+    expect(formatInfo({ ...baseData, procTools: ['ps: ready'] })).toContain(
+      'procTools       ps: ready',
+    );
+  });
+
+  test('shows version, the resolved self-path, claude bin, box=(none), profile marker', () => {
     const out = formatInfo(baseData);
     expect(out).toContain('version         9.9.9');
     expect(out).toContain('claboxBin       /opt/clabox/lib/cli.js');
     expect(out).toContain('claboxRoot      /opt/clabox');
     expect(out).toContain('claudeBin       /usr/local/bin/claude');
     expect(out).toContain('box             (none)');
-    expect(out).toContain('(not built)');
+    // The launch passes the profile to `sandbox-exec -p` inline; the path is
+    // only where `clabox generate` materializes a copy to read.
+    expect(out).toContain('profile         inline at launch');
+    expect(out).toContain('(not generated)');
+  });
+
+  // Each escape hatch hands work to a process that does NOT carry the profile,
+  // so `info` has to say so out loud rather than leaving it to the paths tables.
+  test('escape hatches are listed, and "(none)" is the default', () => {
+    expect(formatInfo(baseData)).toContain('escapes         (none)');
+    const out = formatInfo({
+      ...baseData,
+      escapeHatches: ['allowOpen (`open` starts processes outside the box)'],
+    });
+    expect(out).toContain('escapes         allowOpen');
+  });
+
+  test('the config-file row carries how it passed the trust gate', () => {
+    const out = formatInfo({
+      ...baseData,
+      configFile: '/repo/boxes/x.mjs',
+      configTrust: 'trusted',
+    });
+    expect(out).toContain('/repo/boxes/x.mjs (trust: trusted)');
   });
 
   test('marks missing binaries / unknown self-path instead of crashing', () => {
@@ -154,8 +187,22 @@ describe('formatInfo', () => {
 
   test('empty list fields render as "-"', () => {
     const out = formatInfo(baseData);
-    expect(out).toContain('readWrite       -');
+    expect(out).toContain('write           -');
     expect(out).toContain('mcp             (none)');
+  });
+
+  // The report prints the three access classes under their canonical names, with
+  // the legacy `readOnly`/`readWrite` aliases folded in — so a box that still
+  // spells it the old way sees its grants under `read`/`write` all the same.
+  test('path grants are reported as write / read / stat, aliases folded in', () => {
+    const out = formatInfo({
+      ...baseData,
+      paths: { readWrite: ['~/w'], readOnly: ['~/ro'], read: ['~/r'], stat: ['~/s'] } as never,
+    });
+    expect(out).toContain('write           ~/w');
+    expect(out).toContain('read            ~/ro');
+    expect(out).toContain('                ~/r');
+    expect(out).toContain('stat            ~/s');
   });
 
   test('collapses a multiline extra arg onto one line', () => {

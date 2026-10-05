@@ -5,6 +5,7 @@
 // Configure in plain JS: clabox.config.mjs (CWD) or
 // ~/.config/clabox/config.mjs. See clabox.config.example.mjs.
 
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { createLogger } from '@lsk4/log';
 import yargs from 'yargs';
@@ -13,6 +14,8 @@ import { runDaemon } from './daemon/daemon.js';
 import { formatInfo, gatherInfo } from './info/info.js';
 import { buildShellCommand, bundleId } from './init/ghostty.js';
 import { runInit } from './init/scaffold.js';
+import { sendOpenRequest } from './opener/client.js';
+import { openerPid, runOpener, stopOpener } from './opener/server.js';
 import {
   buildOpenScript,
   GHOSTTY_BUNDLE_ID,
@@ -24,14 +27,17 @@ import {
 import { generateProfile, profilePath, resolveProjectDir, runClaude } from './sandbox/run.js';
 import {
   type Config,
+  claboxHomeDir,
   configsDir,
   expandHome,
   FLAG_FETCH_BLOCKERS,
+  findConfigFile,
   loadConfig,
   resolveBox,
   withExtraEnv,
   withExtraPaths,
 } from './utils/config.js';
+import { listTrusted, trustConfig, untrustConfig } from './utils/trust.js';
 
 /** Pick the explicit config path: a `--box <name>` wins over `--config <path>`. */
 // Index signature so any yargs argv (incl. commands with an empty builder)
@@ -45,22 +51,44 @@ function explicitConfig(argv: {
   return (argv.config as string | undefined) ?? undefined;
 }
 
-/** Layer the ad-hoc `--ro`/`--rw`/`--rc`/`--env` CLI overrides onto the config. */
+/**
+ * `loadConfig` for a parsed argv — resolves `--box`/`--config` and forwards
+ * `--trust`, which is what lets a config file outside clabox's own home (or
+ * inside a tree the box can write) be loaded at all. See utils/trust.ts.
+ */
+function load(argv: { box?: unknown; config?: unknown; trust?: unknown; [k: string]: unknown }) {
+  return loadConfig(explicitConfig(argv), { trust: Boolean(argv.trust) });
+}
+
+/** Layer the ad-hoc `--ro`/`--rw`/`--stat`/`--socket`/`--rc`/`--env` CLI overrides onto the config. */
 function withCliPaths(
   config: Config,
-  argv: { ro?: unknown; rw?: unknown; rc?: unknown; env?: unknown },
+  argv: {
+    ro?: unknown;
+    rw?: unknown;
+    stat?: unknown;
+    socket?: unknown;
+    rc?: unknown;
+    env?: unknown;
+  },
 ): Config {
   const withPaths = withExtraPaths(config, {
     readOnly: (argv.ro as string[] | undefined) ?? [],
     readWrite: (argv.rw as string[] | undefined) ?? [],
+    stat: (argv.stat as string[] | undefined) ?? [],
+    socket: (argv.socket as string[] | undefined) ?? [],
   });
   // `--rc` entries come first so an explicit `-e KEY=VALUE` after them still
   // wins (last entry takes the key): the flag is a default, not an override of
   // what you typed.
-  return withExtraEnv(withPaths, [
+  const withEnv = withExtraEnv(withPaths, [
     ...(argv.rc ? FLAG_FETCH_BLOCKERS : []),
     ...((argv.env as string[] | undefined) ?? []),
   ]);
+  // `--rc` also opens the daemon socket for this launch: Remote Control needs
+  // it, and a box that doesn't use `/rc` has no reason to be able to reach the
+  // one process that can re-host its session unsandboxed (see Config.remoteControl).
+  return argv.rc ? { ...withEnv, remoteControl: true } : withEnv;
 }
 
 /**
@@ -74,12 +102,16 @@ function forwardedGlobals(argv: {
   env?: unknown;
   ro?: unknown;
   rw?: unknown;
+  stat?: unknown;
+  socket?: unknown;
 }): string[] {
   const out: string[] = [];
   if (argv.rc) out.push('--rc');
   for (const e of (argv.env as string[] | undefined) ?? []) out.push('-e', e);
   for (const p of (argv.ro as string[] | undefined) ?? []) out.push('--ro', p);
   for (const p of (argv.rw as string[] | undefined) ?? []) out.push('--rw', p);
+  for (const p of (argv.stat as string[] | undefined) ?? []) out.push('--stat', p);
+  for (const p of (argv.socket as string[] | undefined) ?? []) out.push('--socket', p);
   return out;
 }
 
@@ -116,6 +148,23 @@ await yargs(hideBin(process.argv))
     nargs: 1,
     describe: 'Extra read-write path granted to the sandbox (repeatable)',
   })
+  // The narrowest of the three classes: existence/size/mtime, no contents. The
+  // profile grants no metadata globally, so this is how a path whose *contents*
+  // must stay denied still becomes stat-able.
+  .option('stat', {
+    type: 'string',
+    array: true,
+    nargs: 1,
+    describe: 'Extra stat-only path (metadata, no contents) granted to the sandbox (repeatable)',
+  })
+  // Unix sockets are denied by default — a socket connect is networking, not file
+  // I/O, so no --ro/--rw grants one. This is the opt-in.
+  .option('socket', {
+    type: 'string',
+    array: true,
+    nargs: 1,
+    describe: 'Unix socket (or dir of sockets) the sandbox may connect to (repeatable)',
+  })
   // Ad-hoc env override for this launch only: `KEY=VALUE` sets, a bare `KEY`
   // UNsets (`env -u KEY`) — the only way to drop a var a preset/shell exported,
   // e.g. `-e DISABLE_TELEMETRY` to get feature flags (and `/rc`) in one tab.
@@ -131,7 +180,14 @@ await yargs(hideBin(process.argv))
   .option('rc', {
     type: 'boolean',
     default: false,
-    describe: `Unset the vars that block feature-flag fetching (${FLAG_FETCH_BLOCKERS.join(', ')}) so /rc works, and mark the tab (badge + background)`,
+    describe: `Unset the vars that block feature-flag fetching (${FLAG_FETCH_BLOCKERS.join(', ')}) so /rc works, grant the daemon socket, and mark the tab`,
+  })
+  // A config file is code clabox runs OUTSIDE the sandbox, so one from a tree a
+  // box can write has to be accepted explicitly (see utils/trust.ts).
+  .option('trust', {
+    type: 'boolean',
+    default: false,
+    describe: 'Load an untrusted / box-writable config file for this run (see `clabox trust`)',
   })
   .command(
     ['run [claudeArgs..]', '$0 [claudeArgs..]'],
@@ -143,7 +199,7 @@ await yargs(hideBin(process.argv))
         default: [] as string[],
       }),
     async (argv) => {
-      const { config, configFile } = await loadConfig(explicitConfig(argv));
+      const { config, configFile } = await load(argv);
       const claudeArgs = (argv.claudeArgs ?? []) as string[];
       const code = runClaude(withCliPaths(config, argv), claudeArgs, {
         configFile,
@@ -159,7 +215,7 @@ await yargs(hideBin(process.argv))
     'Build the sandbox profile only and print its path',
     (y) => y,
     async (argv) => {
-      const { config } = await loadConfig(explicitConfig(argv));
+      const { config } = await load(argv);
       console.log(generateProfile(withCliPaths(config, argv)));
     },
   )
@@ -168,7 +224,7 @@ await yargs(hideBin(process.argv))
     'Print the sandbox profile path (no build)',
     (y) => y,
     async (argv) => {
-      const { config } = await loadConfig(explicitConfig(argv));
+      const { config } = await load(argv);
       console.log(profilePath(resolveProjectDir(withCliPaths(config, argv))));
     },
   )
@@ -177,10 +233,11 @@ await yargs(hideBin(process.argv))
     'Print clabox/version/box/config diagnostics for the resolved config',
     (y) => y,
     async (argv) => {
-      const { config, configFile } = await loadConfig(explicitConfig(argv));
+      const { config, configFile, trust } = await load(argv);
       const data = gatherInfo(withCliPaths(config, argv), {
         configFile,
         box: argv.box as string | undefined,
+        trust,
       });
       const log = createLogger('clabox');
       // `.log` is the raw passthrough — keeps the aligned table intact (vs. the
@@ -220,7 +277,7 @@ await yargs(hideBin(process.argv))
           describe: 'Print the AppleScript instead of running it',
         }),
     async (argv) => {
-      const { config } = await loadConfig(explicitConfig(argv));
+      const { config } = await load(argv);
       const box = (argv.box as string | undefined) ?? null;
       const projectDir = resolveProjectDir(config);
       const mode: SurfaceMode = argv.split ? 'split' : argv.window ? 'window' : 'tab';
@@ -272,7 +329,7 @@ await yargs(hideBin(process.argv))
           describe: 'Start it in the background and return instead of holding the terminal',
         }),
     async (argv) => {
-      const { config } = await loadConfig(explicitConfig(argv));
+      const { config } = await load(argv);
       const { status, pid, logFile, configDir } = runDaemon(
         config,
         (argv.daemonArgs ?? []) as string[],
@@ -285,6 +342,158 @@ await yargs(hideBin(process.argv))
         log.log(`  log        ${logFile}`);
       }
       process.exit(status);
+    },
+  )
+  // The opener broker: runs OUTSIDE the sandbox and performs the narrow slice of
+  // `open` a box legitimately wants (reveal a folder, open a file in your
+  // editor) without granting `lsopen`, which would let the box launch anything.
+  .command(
+    'opener',
+    'Run the opener broker OUTSIDE the sandbox — one per machine, serves every box',
+    (y) =>
+      y
+        .option('detach', {
+          type: 'boolean',
+          default: false,
+          describe: 'Start it in the background and return instead of holding the terminal',
+        })
+        .option('root', {
+          type: 'string',
+          array: true,
+          nargs: 1,
+          describe: 'Directory requests may point into (repeatable; default: $HOME)',
+        })
+        .option('editor', {
+          type: 'string',
+          describe: 'App for `clabox open`, e.g. "Zed" (default: the system text editor)',
+        })
+        .option('stop', { type: 'boolean', default: false, describe: 'Stop the running broker' })
+        .option('status', { type: 'boolean', default: false, describe: 'Is a broker running?' })
+        .option('replace', {
+          type: 'boolean',
+          default: false,
+          describe: 'Stop the running broker and take its place (e.g. to change --editor)',
+        }),
+    async (argv) => {
+      const { config } = await load(argv);
+      const log = createLogger('clabox');
+      // `--stop` / `--status` first: they answer about the singleton rather than
+      // starting anything.
+      if (argv.stop) {
+        const pid = stopOpener();
+        log.log(pid === null ? 'no broker running' : `stopped the broker (pid ${pid})`);
+        process.exit(0);
+      }
+      if (argv.status) {
+        const pid = openerPid();
+        log.log(pid === null ? 'no broker running' : `broker running (pid ${pid})`);
+        process.exit(pid === null ? 1 : 0);
+      }
+      if (argv.detach) {
+        // Check before forking, so `--detach` on an already-running broker says
+        // so instead of spawning a process that immediately gives up.
+        const running = openerPid();
+        if (running !== null && !argv.replace) {
+          log.log(`broker already running (pid ${running}) — nothing to do`);
+          log.log('  --replace to swap it out, --stop to shut it down');
+          process.exit(0);
+        }
+        // Same shape as `daemon --detach`: re-exec ourselves without the flag.
+        const args = process.argv.slice(1).filter((a) => a !== '--detach');
+        const child = spawn(process.execPath, args, { detached: true, stdio: 'ignore' });
+        child.unref();
+        log.info(`opener started in the background: pid ${child.pid}`);
+        process.exit(0);
+      }
+      const { socket, logFile, aliasesFile, roots, editor, autoEditor, alreadyRunning } = runOpener(
+        config,
+        {
+          roots: (argv.root as string[] | undefined) ?? [],
+          editor: argv.editor as string | undefined,
+          replace: argv.replace as boolean,
+          onEvent: (o) =>
+            o.ok
+              ? log.info(`${o.request?.action} ${o.request?.target}`)
+              : log.warn(`denied ${o.request?.target ?? '(unparsed)'} — ${o.reason}`),
+        },
+      );
+      if (alreadyRunning) {
+        log.log(`broker already running (pid ${alreadyRunning}) — nothing to do`);
+        log.log('  --replace to swap it out, --stop to shut it down');
+        process.exit(0);
+      }
+      log.info('opener broker listening (outside the sandbox) — serves every box');
+      log.log(`  socket   ${socket}`);
+      log.log(`  log      ${logFile}`);
+      log.log(`  aliases  ${aliasesFile}`);
+      log.log(`  roots    ${roots.join(', ')}`);
+      log.log(
+        `  editor   ${editor ?? `auto — code → ${autoEditor ?? 'system text editor'}, vault notes → Obsidian, images → Preview`}`,
+      );
+      // The helpers are useless unsourced, and nobody guesses the path.
+      log.log(`  shortcuts: source ${aliasesFile}   # then \`o .\` / \`c file\` work in any box`);
+    },
+  )
+  // The in-box side. `reveal` shows a path in Finder (`open -R`, which never
+  // launches anything); `open` hands a file to the configured editor.
+  .command(
+    ['reveal <path>', 'show <path>'],
+    'Ask the broker to reveal a path in Finder (works inside the sandbox)',
+    (y) => y.positional('path', { type: 'string', describe: 'File or directory to reveal' }),
+    async (argv) => {
+      const reply = await sendOpenRequest('reveal', argv.path as string);
+      console.log(reply.message);
+      process.exit(reply.ok ? 0 : 1);
+    },
+  )
+  .command(
+    'open <path>',
+    'Ask the broker to open a file in the configured editor (works inside the sandbox)',
+    (y) => y.positional('path', { type: 'string', describe: 'File to open' }),
+    async (argv) => {
+      const reply = await sendOpenRequest('edit', argv.path as string);
+      console.log(reply.message);
+      process.exit(reply.ok ? 0 : 1);
+    },
+  )
+  // The counterpart of the trust gate in loadConfig: record a config file so it
+  // can be loaded from outside clabox's own home. Keyed by content hash, so an
+  // edit (by you or by an agent) de-trusts it until you look again.
+  .command(
+    'trust [file]',
+    'Trust a config file so clabox may run it (default: the resolved one)',
+    (y) =>
+      y
+        .positional('file', { type: 'string', describe: 'Config file to trust' })
+        .option('list', { type: 'boolean', default: false, describe: 'List trusted configs' })
+        .option('remove', { type: 'boolean', default: false, describe: 'Un-trust it instead' }),
+    async (argv) => {
+      const log = createLogger('clabox');
+      const home = claboxHomeDir();
+      if (argv.list) {
+        const entries = listTrusted(home);
+        if (!entries.length) log.log('(no trusted configs — only ~/.config/clabox is trusted)');
+        for (const e of entries) log.log(`  ${e.state === 'stale' ? '⚠️ ' : '✓ '} ${e.file}`);
+        process.exit(0);
+      }
+      const file =
+        (argv.file as string | undefined) ??
+        explicitConfig(argv) ??
+        findConfigFile(null) ??
+        undefined;
+      if (!file) {
+        log.warn('no config file to trust — pass a path, or -b <box>');
+        process.exit(1);
+      }
+      if (argv.remove) {
+        log.log(untrustConfig(file, home) ? `un-trusted ${file}` : `not trusted: ${file}`);
+        process.exit(0);
+      }
+      const rec = trustConfig(file, home);
+      log.info(`trusted ${rec.file}`);
+      log.log(`  ${rec.hash}`);
+      log.log('  Re-run `clabox trust` after editing it — the record is content-keyed.');
+      process.exit(0);
     },
   )
   .command(
@@ -311,6 +520,9 @@ await yargs(hideBin(process.argv))
           baseDir: argv.dir as string | undefined,
           buildApps: argv.apps as boolean,
           only: (argv.app as string | undefined) ?? null,
+          // `init` imports every box config it finds, so `--dir <repo>` is the
+          // same unsandboxed-code-execution step as a launch — same gate.
+          trust: Boolean(argv.trust),
         });
       console.log(`clabox init: ${profiles.length} profile(s) → ${profiles.join(', ')}`);
       for (const f of written) console.log(`  ${path.basename(f)}`);
@@ -327,6 +539,8 @@ await yargs(hideBin(process.argv))
   .example('$0 run --dangerously-skip-permissions', 'YOLO mode inside the sandbox')
   .example('$0 --ro ~/dir2 run', 'Grant the sandbox read-only access to ~/dir2')
   .example('$0 --ro ~/a --rw ~/b run', 'Extra RO + RW grants (both flags repeatable)')
+  .example('$0 --stat ~/Library/Group\\ Containers run', 'Let the box stat a path, not read it')
+  .example('$0 --socket /var/run/docker.sock run', 'Let the box talk to one unix socket')
   .example('$0 -b ax-mg --rc', 'Unset every var that would hide Remote Control (/rc)')
   .example('$0 -b ax-mg -e DISABLE_TELEMETRY', 'Unset a preset var for this tab (re-enables /rc)')
   .example('$0 -b ax-mg -e DISABLE_TELEMETRY=1', 'Or force it on for this tab only')

@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { boxSlug, buildBoxExtras } from '../sandbox/extras.js';
+import { needsRefresh, PROC_TOOLS } from '../sandbox/proctools.js';
 import {
   countUserProcs,
   maxProcPerUid,
@@ -16,7 +17,15 @@ import {
   resolveUlimit,
   which,
 } from '../sandbox/run.js';
-import { type BotConfig, type Config, expandHome, HOME, type PathRules } from '../utils/config.js';
+import {
+  type BotConfig,
+  type Config,
+  claboxBinDir,
+  expandHome,
+  HOME,
+  type PathRules,
+  resolvedPathRules,
+} from '../utils/config.js';
 
 /** clabox's own package: the install root + version, located at runtime. */
 export interface ClaboxPackage {
@@ -79,12 +88,20 @@ export interface InfoData {
   slug: string;
   /** Dir claude runs in and that's granted RW as the project. */
   projectDir: string;
-  /** Deterministic profile path for {@link InfoData.projectDir}. */
+  /** Where `clabox generate` materializes the profile (the launch is inline). */
   profileFile: string;
-  /** Whether the profile has been generated already. */
+  /** Whether that materialized copy exists. */
   profileExists: boolean;
   /** Config file the effective config came from, null → built-in defaults. */
   configFile: string | null;
+  /** How that config file passed the trust gate (null → built-in defaults). */
+  configTrust: string | null;
+  /**
+   * The escape hatches this box opted into — empty when none, which is the
+   * default. Printed as one loud row because each one hands work to a process
+   * that does NOT carry the profile.
+   */
+  escapeHatches: string[];
   /** Expanded `config.configDir` (Claude's profile dir). */
   configDir: string;
   network: boolean;
@@ -113,6 +130,8 @@ export interface InfoData {
   extraFiles: string[];
   /** clabox-relevant vars present in the process env (`KEY=VALUE`). */
   processEnv: string[];
+  /** De-privileged tool copies in `<claboxHome>/bin` (`name: status`). */
+  procTools: string[];
 }
 
 /** Env vars clabox itself reads (shown verbatim in the `[env]` section). */
@@ -129,6 +148,23 @@ const TRACKED_ENV = [
 export interface GatherInfoOptions {
   configFile?: string | null;
   box?: string | null;
+  /** Trust state reported by `loadConfig` for {@link GatherInfoOptions.configFile}. */
+  trust?: string | null;
+}
+
+/**
+ * The opt-in grants that let work leave the sandbox, named the way the config
+ * names them. Each one is a deliberate hole, so `info` lists them rather than
+ * burying them in the paths tables.
+ */
+export function escapeHatches(config: Config): string[] {
+  const out: string[] = [];
+  if (config.allowBackgroundTasks) {
+    out.push('allowBackgroundTasks (daemon re-hosts the session UNSANDBOXED)');
+  }
+  if (config.allowOpen) out.push('allowOpen (`open` starts processes outside the box)');
+  if (config.remoteControl) out.push('remoteControl (daemon socket granted)');
+  return out;
 }
 
 /** Snapshot the effective config + runtime resolution into an {@link InfoData}. */
@@ -162,6 +198,8 @@ export function gatherInfo(config: Config, opts: GatherInfoOptions = {}): InfoDa
     profileFile,
     profileExists: fs.existsSync(profileFile),
     configFile: opts.configFile ?? null,
+    configTrust: opts.trust ?? null,
+    escapeHatches: escapeHatches(config),
     configDir: expandHome(config.configDir),
     network: config.network,
     ulimitProcs: config.ulimitProcs,
@@ -188,7 +226,26 @@ export function gatherInfo(config: Config, opts: GatherInfoOptions = {}): InfoDa
     extraArgs: extras.claudeArgs,
     extraFiles: extras.files.map((f) => f.path),
     processEnv,
+    // Reports state without installing anything: `info` is a read-only report,
+    // so a missing copy shows up as the warning it is instead of being fixed
+    // behind the user's back (`run` installs it).
+    procTools: reportProcTools(),
   };
+}
+
+/** `<name>: <status>` per de-privileged tool copy, without touching the disk. */
+function reportProcTools(): string[] {
+  if (process.platform !== 'darwin') return [];
+  return PROC_TOOLS.map((tool) => {
+    const dest = path.join(claboxBinDir(), tool.name);
+    try {
+      const dst = fs.statSync(dest);
+      const src = fs.statSync(tool.source);
+      return `${tool.name}: ${needsRefresh(src, dst) ? 'stale (refreshed on next run)' : 'ready'}`;
+    } catch {
+      return `${tool.name}: missing (installed on next run)`;
+    }
+  });
 }
 
 const LABEL_WIDTH = 16;
@@ -262,11 +319,23 @@ export function formatInfo(d: InfoData, { color = false }: FormatInfoOptions = {
   row('box', d.box ?? '(none)');
   row('slug', d.slug);
   row('project', tildify(d.projectDir));
-  const builtNote = d.profileExists ? '' : paint(ANSI.dim, ' (not built)');
-  row('profile', tildify(d.profileFile) + builtNote);
+  // The launch hands the profile to `sandbox-exec -p` inline; this path is only
+  // where `clabox generate` materializes a copy to read (run.ts#profilePath).
+  const builtNote = paint(ANSI.dim, d.profileExists ? ' (generate copy)' : ' (not generated)');
+  row('profile', `inline at launch — ${tildify(d.profileFile)}${builtNote}`);
+  // Loud by design: every entry is a documented way out of the sandbox.
+  row(
+    'escapes',
+    d.escapeHatches.length ? paint(ANSI.yellow, d.escapeHatches.join(', ')) : '(none)',
+  );
 
   header('config');
-  row('configFile', d.configFile ? tildify(d.configFile) : '(defaults — no file)');
+  row(
+    'configFile',
+    d.configFile
+      ? `${tildify(d.configFile)}${d.configTrust ? paint(ANSI.dim, ` (trust: ${d.configTrust})`) : ''}`
+      : '(defaults — no file)',
+  );
   row('configDir', tildify(d.configDir));
   row('network', d.network);
   row(
@@ -283,13 +352,23 @@ export function formatInfo(d: InfoData, { color = false }: FormatInfoOptions = {
   row('systemPrompt', d.hasSystemPrompt ? '(set)' : '(none)');
   row('hooks', d.hookEvents.join(', ') || '(none)');
   listRows('claudeArgs', d.claudeArgs);
-  listRows('readWrite', d.paths.readWrite);
-  listRows('readOnly', d.paths.readOnly);
-  listRows('exec', d.paths.exec);
-  listRows('deny', d.paths.deny);
+  // The three access classes under their canonical names, with the legacy
+  // `readOnly`/`readWrite` aliases already folded in — what the profile will
+  // actually grant, not what the config happened to spell.
+  const grants = resolvedPathRules(d.paths);
+  listRows('write', grants.write);
+  listRows('read', grants.read);
+  listRows('stat', grants.stat);
+  listRows('exec', grants.exec);
+  listRows('socket', grants.socket);
+  listRows('deny', grants.deny);
+  listRows('denyGlobs', grants.denyGlobs);
+  listRows('denyWriteGlobs', grants.denyWriteGlobs);
   row('denyHome', d.denyHome.join(', ') || '(none)');
   row('denyDotConfigs', d.denyDotConfigs.join(', ') || '(none)');
   listRows('env', d.env);
+
+  row('procTools', d.procTools.join(', ') || '(none)');
 
   header('extras', 'compiled from this box: mcp / systemPrompt / hooks');
   listRows(
