@@ -6,7 +6,18 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { type Config, claboxHomeDir, expandHome, HOME } from '../utils/config.js';
+import {
+  BASE_PATH_GROUPS,
+  type Config,
+  claboxHomeDir,
+  expandHome,
+  type GrantTable,
+  HOME,
+  openerSocketPath,
+  resolvedOpener,
+  resolvedPathRules,
+  untouchedBaseKeys,
+} from '../utils/config.js';
 
 // ---- SBPL helpers ----------------------------------------------------------
 
@@ -14,14 +25,61 @@ import { type Config, claboxHomeDir, expandHome, HOME } from '../utils/config.js
 // left as-is so regex patterns survive verbatim.
 const q = (s: string): string => `"${String(s).replace(/"/g, '\\"')}"`;
 
+/**
+ * Quote a **regex** for SBPL. Same as {@link q} plus the part that bit us: an
+ * SBPL string processes its own escapes before the regex engine ever sees the
+ * text, so a lone `\` is eaten. `\.env` therefore reached the matcher as `.env`
+ * — a dot that matches *any* character — and a `denyGlobs: ['**​/.env*']` silently
+ * denied `_envs.mjs`, `aenv` and every other `?env*` name, which surfaces as an
+ * `EPERM` on a file nobody meant to hide.
+ *
+ * Apple's own profiles show both ways out: the literal-string form
+ * `(regex #"^/Library/Keychains/\.fl[0-9A-F]+$")`, and doubling inside a plain
+ * string (`(mount-relative-regex "^/\\.Trashes(/|$)")`). We double, because the
+ * literal form has no way to escape a `"` and the patterns come from user config.
+ */
+const reQ = (s: string): string => `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+
 export const subpath = (p: string): string => `(subpath ${q(p)})`;
 export const literal = (p: string): string => `(literal ${q(p)})`;
-export const regex = (p: string): string => `(regex ${q(p)})`;
+export const regex = (p: string): string => `(regex ${reQ(p)})`;
 export const globalName = (n: string): string => `(global-name ${q(n)})`;
 export const ipcName = (n: string): string => `(ipc-posix-name ${q(n)})`;
+/**
+ * `(target <who>)` — the filter that scopes `signal` / `process-info*` to a set
+ * of processes relative to the sandboxed one. Values seen in Apple's own
+ * profiles under /System/Library/Sandbox/Profiles: `self`, `children`,
+ * `same-sandbox`, `pgrp`, `others`. It is a bare symbol, not a string, so it is
+ * NOT quoted.
+ */
+export const target = (who: string): string => `(target ${who})`;
 
 /** Escape a path for safe embedding inside an SBPL regex. */
 export const reEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Every directory *above* `p`, from its parent up to `/` — the chain a path
+ * lookup walks through.
+ *
+ * Needed because the profile no longer grants `file-read-metadata` globally:
+ * resolving `/a/b/c` touches `/a` and `/a/b` on the way, and a tool that
+ * `realpath`s or `stat`s its way down (git, node's module resolution, `cd`) gets
+ * an `EPERM` instead of a plain answer when an intermediate directory is denied.
+ * Granting metadata on the *ancestors alone* costs nothing: each one is a
+ * directory already named in the profile, and `literal` (not `subpath`) keeps the
+ * grant to the directory itself — its children stay as denied as before.
+ *
+ * Pure. `/` yields `[]`.
+ */
+export function pathAncestors(p: string): string[] {
+  const out: string[] = [];
+  let cur = path.resolve(p);
+  while (cur !== '/') {
+    cur = path.dirname(cur);
+    out.push(cur);
+  }
+  return out;
+}
 
 /**
  * Compile one gitignore-style glob into an SBPL regex *body* — the part that
@@ -60,6 +118,105 @@ function block(op: string, rules: string[]): string {
 const allow = (op: string, ...rules: string[]): string => block(`allow ${op}`, rules);
 const deny = (op: string, ...rules: string[]): string => block(`deny ${op}`, rules);
 
+// ---- the grant table: `path: rights` → SBPL ---------------------------------
+
+/**
+ * One right letter → the SBPL operation it stands for. The same letters a box
+ * writes in its config (`PathGrant` in config.ts), plus the ones only the
+ * built-in rules need:
+ *
+ *   r  file-read*            read contents, metadata, xattrs
+ *   w  file-write*           (emitted with `r`: a writable path is readable)
+ *   s  file-read-metadata    stat(2) only
+ *   e  process-exec          exec a binary from here
+ *   m  file-map-executable   mmap it executable — dyld needs this for libraries
+ *   i  file-ioctl            ioctl(2) (ttys)
+ *   c  network-outbound      connect(2) to a unix socket at this path
+ *
+ * Order here is the order they're printed in, so the generated profile reads the
+ * same way every time.
+ */
+const RIGHT_OPS: Array<[string, string]> = [
+  ['r', 'file-read*'],
+  ['w', 'file-write*'],
+  ['s', 'file-read-metadata'],
+  ['m', 'file-map-executable'],
+  ['e', 'process-exec'],
+  ['i', 'file-ioctl'],
+  ['c', 'network-outbound'],
+];
+
+/**
+ * Compile a {@link GrantTable} into SBPL rules.
+ *
+ * Paths that carry the same set of rights are grouped into one rule, in first-
+ * appearance order, so a table of a dozen entries still prints as two or three
+ * blocks. Every `allow`ed path is handed to `onGrant` (the stat-ancestors pass
+ * needs to know which paths exist in the profile); denied and regex entries are
+ * not, since a denied path's ancestors are nobody's business and a regex has no
+ * path to walk up from.
+ */
+export function grantBlock(table: GrantTable, onGrant?: (p: string) => void): string {
+  // ops-signature → matchers, insertion-ordered by Map semantics
+  const groups = new Map<string, string[]>();
+  const push = (key: string, matcher: string) => {
+    const list = groups.get(key);
+    if (list) list.push(matcher);
+    else groups.set(key, [matcher]);
+  };
+
+  for (const [rawPath, rights] of Object.entries(table)) {
+    const isRegex = rawPath.startsWith('^');
+    const letters = new Set(rights);
+    // `w` implies `r`: every write grant in this profile has always been emitted
+    // as `file-read* file-write*`, and a write-only path would be a trap (you can
+    // create a file you then can't open).
+    if (letters.has('w')) letters.add('r');
+    const matcher = isRegex
+      ? regex(rawPath)
+      : letters.has('l')
+        ? literal(rawPath)
+        : subpath(rawPath);
+
+    if (letters.has('d')) {
+      // A deny has to cover every class, not just the file ones — a socket
+      // connect is `network-outbound`, so a file-only deny leaves the socket
+      // inside a denied directory reachable.
+      push('deny:file-read* file-write*', matcher);
+      push('deny:network-outbound', matcher);
+      continue;
+    }
+    if (!isRegex) onGrant?.(rawPath);
+
+    // A socket grant is emitted as BOTH matchers, because the path is sometimes a
+    // single socket file (`.../mDNSResponder`, `docker.sock`) and sometimes the dir
+    // holding them (claude's daemon dir, whose socket names carry a hash). Apple's
+    // profiles use `literal` for the former and `subpath` for the latter; emitting
+    // both means a config needn't know which kind it named. `l` pins it to literal.
+    if (letters.has('c')) {
+      push('allow:network-outbound', isRegex || letters.has('l') ? matcher : literal(rawPath));
+      if (!isRegex && !letters.has('l')) push('allow:network-outbound', subpath(rawPath));
+    }
+    const ops = RIGHT_OPS.filter(([letter]) => letter !== 'c' && letters.has(letter)).map(
+      ([, op]) => op,
+    );
+    if (!ops.length) continue;
+    push(`allow:${ops.join(' ')}`, matcher);
+  }
+
+  return [...groups]
+    .map(([key, matchers]) => {
+      const [kind, ops] = [key.slice(0, key.indexOf(':')), key.slice(key.indexOf(':') + 1)];
+      return kind === 'deny' ? deny(ops, ...matchers) : allow(ops, ...matchers);
+    })
+    .join('\n');
+}
+
+/** `{ '<path>': rights }` for every path in `list` — a table from a plain array. */
+export function sameRights(list: string[], rights: string): GrantTable {
+  return Object.fromEntries(list.map((p) => [p, rights]));
+}
+
 // ---- package-manager autodetection ----------------------------------------
 
 /** Detect installed package managers whose paths must be readable/executable. */
@@ -97,6 +254,16 @@ export function resolvedClaboxHome(): string[] {
 const STATIC_DEVELOPER_DIRS = ['/Library/Developer/CommandLineTools', '/Applications/Xcode.app'];
 
 /**
+ * The links `xcode-select` maintains to record the active developer dir, newest
+ * location first. Apple moved it: `/var/db/xcode_select_link` through macOS 15,
+ * `/var/select/developer_dir` on 26+ (the path named in the shims' own error,
+ * `unable to read data link at '/var/select/developer_dir'`). Reading only the old
+ * one silently finds nothing on a current mac, so both are tried — and both are
+ * granted in `BASE_PATH_GROUPS`, since a shim has to read the link itself.
+ */
+const XCODE_SELECT_LINKS = ['/var/select/developer_dir', '/var/db/xcode_select_link'];
+
+/**
  * The **resolved** developer directories to grant on top of
  * {@link STATIC_DEVELOPER_DIRS} — Seatbelt matches the symlink-resolved path, so
  * a nominal grant misses a toolchain that lives behind a link.
@@ -109,13 +276,13 @@ const STATIC_DEVELOPER_DIRS = ['/Library/Developer/CommandLineTools', '/Applicat
  * CPython dies before it starts — the symptom that shows up as the entropy
  * regression test failing only in CI.
  *
- * Read through `/var/db/xcode_select_link` (the link `xcode-select` maintains)
- * rather than by running `xcode-select`, keeping this to `fs` autodetection.
- * Best-effort: an unreadable or absent link contributes nothing.
+ * Read through {@link XCODE_SELECT_LINKS} rather than by running `xcode-select`,
+ * keeping this to `fs` autodetection. Best-effort: an unreadable or absent link
+ * contributes nothing.
  */
 export function resolvedDeveloperDirs(): string[] {
   const out = new Set<string>();
-  for (const p of ['/var/db/xcode_select_link', ...STATIC_DEVELOPER_DIRS]) {
+  for (const p of [...XCODE_SELECT_LINKS, ...STATIC_DEVELOPER_DIRS]) {
     let real: string;
     try {
       if (!fs.existsSync(p)) continue;
@@ -123,8 +290,8 @@ export function resolvedDeveloperDirs(): string[] {
     } catch {
       continue;
     }
-    // `xcode_select_link` points at `<bundle>/Contents/Developer`; grant the
-    // whole bundle, since the shims reach outside Contents/Developer too.
+    // Either link points at `<bundle>/Contents/Developer`; grant the whole
+    // bundle, since the shims reach outside Contents/Developer too.
     const root = real.replace(/\/Contents\/Developer$/, '');
     if (!STATIC_DEVELOPER_DIRS.includes(root)) out.add(root);
   }
@@ -149,9 +316,29 @@ export function buildProfile(
   const configDir = expandHome(config.configDir);
   const sshDir = expandHome(config.bot.sshDir);
   const homeRe = reEscape(HOME);
+  // The box's OWN grants: everything in `config.paths` that isn't a base-policy
+  // key (those are emitted by `baseGroup` above, in their own sections).
+  const paths = resolvedPathRules(config.paths, untouchedBaseKeys(config.paths));
 
   const sections: string[] = [];
   const add = (comment: string, body: string) => sections.push(`;; ---------- ${comment}\n${body}`);
+
+  // Path-matchers for the ALLOW rules go through these two wrappers instead of
+  // the bare `subpath`/`literal`, so every granted path is also recorded for the
+  // stat-ancestors section at the bottom (see pathAncestors). Deny rules keep
+  // using the bare helpers — a denied path's ancestors are nobody's business.
+  const granted = new Set<string>();
+  // Extra dirs that need a bare metadata grant of their own: roots of `regex`
+  // rules, which carry no plain path for the ancestors pass to walk up from.
+  const statRoots: string[] = [];
+  const sp = (p: string): string => {
+    granted.add(p);
+    return subpath(p);
+  };
+  const lit = (p: string): string => {
+    granted.add(p);
+    return literal(p);
+  };
 
   sections.push(
     [
@@ -168,122 +355,88 @@ export function buildProfile(
   // default)` trims `ps` down to the sandboxed process itself. This leaks no
   // more than the already-unconditional `sysctl-read`, which hands out every
   // process's argv via KERN_PROCARGS2, so it lives here in introspection too.
-  add(
-    'introspection & sysctl',
-    '(allow file-read-metadata)\n(allow sysctl-read)\n(allow process-info*)',
-  );
+  //
+  // Note what is NOT here any more: a bare `(allow file-read-metadata)`. It used
+  // to sit in this section (introspection needs to stat things), but with no
+  // filter it granted `stat(2)` on the WHOLE disk — including every path the
+  // deny tiers below work hard to hide, since a `stat` is not a `file-read-data`
+  // and the two are separate operations in SBPL. The result was a box that could
+  // not list `~/Library/Group Containers/…` yet could confirm, byte-size and
+  // mtime included, exactly which files lived there. `stat` is now a path-scoped
+  // right like read and write: implied by every read/write grant (`file-read*`
+  // covers `file-read-metadata`), re-openable per path via `paths.stat`, and
+  // granted on granted paths' ancestors at the very bottom of this profile.
+  add('introspection & sysctl', '(allow sysctl-read)\n(allow process-info*)');
 
+  // A box that can start `npm run dev` has to be able to stop it again —
+  // without a `signal` rule `(deny default)` covers kill(2) too, so every
+  // process the agent spawns is immortal until the box exits. The `target`
+  // filter is what keeps this from being a global grant:
+  //   * `children`     — what this process spawned directly;
+  //   * `same-sandbox` — the whole inherited tree. The profile is inherited
+  //     across fork/exec and cannot be dropped, so a grandchild (npm → node →
+  //     frpc) is still in *this* box, while anything outside it is not.
+  // Nothing outside the box becomes signalable; tests/profile.test.ts asserts
+  // that against a real process rather than trusting the (undocumented) filter.
+  //
+  // `process-info-setcontrol (target self)` is setpriority(2) — zsh job control
+  // nices its background jobs, and without it every `cmd &` fails the spawn
+  // with `nice(5) failed: operation not permitted`. Chromium's renderer profile
+  // carries the same rule.
   add(
-    'basic dir traversal',
+    'process control (signals stay inside the box)',
     [
-      allow('file-read*', literal('/')),
-      allow('file-read*', literal('/private')),
-      allow('file-read-data', literal('/Users')),
-      allow('file-read-data', literal(HOME)),
+      allow('signal', target('self'), target('children'), target('same-sandbox')),
+      allow('process-info-setcontrol', target('self')),
     ].join('\n'),
   );
 
-  add(
-    'system runtime (read-only)',
-    allow(
-      'file-read* file-map-executable',
-      subpath('/System'),
-      subpath('/usr'),
-      subpath('/bin'),
-      subpath('/sbin'),
-      subpath('/Library/Frameworks'),
-      subpath('/private/etc'),
-      subpath('/var/db/dyld'),
-      ...detectedPaths.map(subpath),
-    ),
-  );
+  // The built-in base policy is DATA, not code: `BASE_PATH_GROUPS` in config.ts
+  // lists every path with its rights (`r` read, `w` write, `s` stat, `m`
+  // map-executable, `e` exec, `i` ioctl, `c` socket, `d` deny, `l` = this path
+  // only) and a one-line note on why it's there. Those entries are also seeded
+  // into `defaultConfig.paths`, so a box can narrow one (`'/System': 'r'`), take
+  // it away (`'~/Library/Keychains': 'd'`) or widen it — the override wins here
+  // while keeping this section's position, which is what makes it safe: SBPL is
+  // last-match-wins, so *where* a rule lands decides whether a later deny buries
+  // it.
+  /** `~`-expand every key, so a table can be written portably. */
+  const expandTable = (table: GrantTable): GrantTable =>
+    Object.fromEntries(Object.entries(table).map(([k, v]) => [expandHome(k), v]));
+  const grants = (table: GrantTable) => grantBlock(expandTable(table), (p) => granted.add(p));
+  const baseGroup = (title: string) => {
+    const group = BASE_PATH_GROUPS.find((g) => g.title === title);
+    if (group) add(group.title, grants(group.paths));
+  };
 
-  // The static pair plus wherever `xcode-select` actually points once symlinks
-  // are resolved — see resolvedDeveloperDirs().
+  baseGroup('basic dir traversal');
+  baseGroup('system runtime + exec (read-only)');
+
+  // Not expressible as static data — these are resolved at run time:
+  //   detectPackagePaths() finds Homebrew / ~/.local / nix,
+  //   resolvedDeveloperDirs() follows `xcode-select` through its symlink.
   const developerDirs = [...STATIC_DEVELOPER_DIRS, ...resolvedDeveloperDirs()];
   add(
-    'Xcode / Command Line Tools (xcrun, git, etc.)',
-    [
-      allow('file-read* file-map-executable', ...developerDirs.map(subpath)),
-      allow('process-exec', ...developerDirs.map(subpath)),
-    ].join('\n'),
+    'package managers + Xcode / Command Line Tools (autodetected)',
+    grants({ ...sameRights(detectedPaths, 'rme'), ...sameRights(developerDirs, 'rme') }),
   );
 
-  // global npm/pipx/cargo bins (user-installed)
-  const userPaths = detectedPaths.filter((p) => p.endsWith('/.local'));
-  add(
-    'global npm/pipx/cargo bins',
-    userPaths.length
-      ? userPaths.map((p) => allow('file-read*', subpath(p))).join('\n')
-      : ';; No user package paths detected',
-  );
+  baseGroup('temp dirs (RW)');
+  // The $TMPDIR rule is a regex, which carries no plain path for the stat-ancestors
+  // pass; without metadata on the container dir, `mkdtemp`/`realpath` inside TMPDIR
+  // trip over it on the way down.
+  const tmpRoot = '/private/var/folders';
+  statRoots.push(tmpRoot, ...pathAncestors(tmpRoot));
 
-  add(
-    'executable paths',
-    allow(
-      'process-exec',
-      subpath('/usr'),
-      subpath('/System'),
-      subpath('/bin'),
-      subpath('/sbin'),
-      literal('/usr/bin/env'),
-      ...detectedPaths.map(subpath),
-    ),
-  );
+  // Claude's own profile dir — a path, but one that comes from `config.configDir`.
+  add('Claude config & token files', grants({ [configDir]: 'rw' }));
 
-  add(
-    'temp dirs',
-    allow(
-      'file-read* file-write*',
-      subpath('/tmp'),
-      subpath('/private/tmp'),
-      regex('^/private/var/folders/'),
-    ),
-  );
-
-  add('Claude config & token files', allow('file-read* file-write*', subpath(configDir)));
-
-  // Claude's own scratch dirs, outside the config dir. Both need WRITE:
-  //   ~/.local/state/claude/locks/<version>.lock — the version lock claude takes
-  //     at startup; it writes a `.lock.tmp.<rand>` next to it, so a read-only
-  //     grant shows up in-box as `EPERM … locks/<version>.lock.tmp.xxxx` +
-  //     "NON-FATAL: Lock acquisition failed".
-  //   ~/Library/Caches/claude-cli-nodejs/** — the per-MCP-server log batches;
-  //     without write every batch is dropped ("Dropping log batch for …").
-  // Neither holds credentials (OAuth tokens live in the keychain), so RW here
-  // widens nothing that matters. `~/.cache/claude` stays read-only — nothing has
-  // been observed writing to it.
-  add(
-    'Claude runtime state & caches (RW) -- version lock + MCP logs',
-    [
-      allow(
-        'file-read* file-write*',
-        subpath(path.join(HOME, '.local/state/claude')),
-        subpath(path.join(HOME, 'Library/Caches/claude-cli-nodejs')),
-      ),
-      allow('file-read*', subpath(path.join(HOME, '.cache/claude'))),
-    ].join('\n'),
-  );
-
-  add(
-    'time-zone & prefs (RO)',
-    allow('file-read*', subpath('/private/var/db/timezone'), subpath('/Library/Preferences')),
-  );
-
-  // `/dev/random` + `/dev/urandom` are the entropy source language runtimes read
-  // at startup — CPython seeds hash randomization from `/dev/urandom` and fatals
-  // (`_Py_HashRandomization_Init: failed to get random numbers`) if it's denied;
-  // Node's `crypto`, openssl and git need it too. Read-only: writing to the pool
-  // is never needed and adding entropy is not a capability the sandbox should grant.
-  add(
-    '/dev access (RO) + ioctl',
-    [
-      allow('file-read*', literal('/dev')),
-      allow('file-read*', literal('/dev/random'), literal('/dev/urandom')),
-      allow('file-read* file-write*', regex('^/dev/(tty.*|null|zero|dtracehelper)')),
-      allow('file-ioctl', literal('/dev/dtracehelper'), regex('^/dev/tty.*')),
-    ].join('\n'),
-  );
+  // These five sections are base-policy data too (BASE_PATH_GROUPS) — the notes
+  // on *why* each path is granted live next to the paths there.
+  baseGroup('Claude runtime state & caches (RW)');
+  baseGroup('package-manager caches (RW)');
+  baseGroup('time-zone & prefs (RO)');
+  baseGroup('/dev access (RO) + ioctl');
 
   add(
     'mach-lookup services',
@@ -291,23 +444,42 @@ export function buildProfile(
       'mach-lookup',
       globalName('com.apple.system.opendirectoryd.libinfo'),
       globalName('com.apple.SystemConfiguration.DNSConfiguration'),
-      globalName('com.apple.coreservices.launchservicesd'),
-      globalName('com.apple.CoreServices.coreservicesd'),
       globalName('com.apple.system.notification_center'),
       globalName('com.apple.logd'),
       globalName('com.apple.diagnosticd'),
+      // The read-only type/UTI database. Plenty of frameworks consult it; it
+      // cannot start a process (that's `modifydb` + launchservicesd below).
       globalName('com.apple.lsd.mapdb'),
-      globalName('com.apple.lsd.modifydb'),
       globalName('com.apple.coreservices.quarantine-resolver'),
       globalName('com.apple.pasteboard.pboard'),
       globalName('com.apple.pasteboard.1'),
     ),
   );
 
-  add(
-    'Launch Services needed by /usr/bin/open',
-    allow('mach-lookup', regex('^com\\.apple\\.lsd(\\..*)?$')),
-  );
+  // Launch Services — `/usr/bin/open` and the services behind it. OFF by
+  // default, because this is an escape, not a convenience: `open` doesn't fork
+  // anything in-box, it asks LaunchServices (outside every sandbox) to start a
+  // target, which comes up under launchd with NO profile. The box can write
+  // `.app` bundles into /tmp, $TMPDIR and the project, so a granted `lsopen` is
+  // arbitrary code execution as the user — the same reason `appleevent-send` is
+  // withheld above. `(allow lsopen)` and the mach services are emitted together:
+  // the gate is checked by the receiving service, so leaving the ports reachable
+  // while denying the operation would be a half-measure.
+  if (config.allowOpen) {
+    add(
+      'Launch Services / `open` (config.allowOpen — ESCAPE HATCH: starts processes outside the box)',
+      [
+        allow(
+          'mach-lookup',
+          globalName('com.apple.coreservices.launchservicesd'),
+          globalName('com.apple.CoreServices.coreservicesd'),
+          globalName('com.apple.lsd.modifydb'),
+          regex('^com\\.apple\\.lsd(\\..*)?$'),
+        ),
+        '(allow lsopen)',
+      ].join('\n'),
+    );
+  }
 
   add(
     'Developer Tools (xcrun / libxcrun)',
@@ -340,95 +512,60 @@ export function buildProfile(
     allow('ipc-posix-shm-read-data', ipcName('apple.shm.notification_center')),
   );
 
+  baseGroup('user prefs & keychain');
   add(
-    'User-level preference reads (RO)',
-    allow('file-read*', subpath(path.join(HOME, 'Library/Preferences'))),
-  );
-
-  // Keychain RW so Claude can persist refreshed OAuth tokens (else ~24h → 401).
-  add(
-    'Keychain access (for OAuth)',
-    [
-      allow('file-read* file-write*', subpath(path.join(HOME, 'Library/Keychains'))),
-      allow(
-        'mach-lookup',
-        globalName('com.apple.SecurityServer'),
-        globalName('com.apple.security.agent'),
-        globalName('com.apple.securityd'),
-        globalName('com.apple.secd'),
-        globalName('com.apple.trustd'),
-        globalName('com.apple.trustd.agent'),
-        globalName('com.apple.CoreAuthentication.daemon'),
-      ),
-    ].join('\n'),
-  );
-
-  add(
-    'git config (RO)',
+    'Keychain mach services (for OAuth)',
     allow(
-      'file-read*',
-      literal(path.join(HOME, '.gitconfig')),
-      literal(path.join(HOME, '.gitignore_global')),
-      subpath(path.join(HOME, '.config/git')),
+      'mach-lookup',
+      globalName('com.apple.SecurityServer'),
+      globalName('com.apple.security.agent'),
+      globalName('com.apple.securityd'),
+      globalName('com.apple.secd'),
+      globalName('com.apple.trustd'),
+      globalName('com.apple.trustd.agent'),
+      globalName('com.apple.CoreAuthentication.daemon'),
     ),
   );
+  baseGroup('git config (RO)');
 
   // Soft privacy DENY list — placed BEFORE the extra readOnly/readWrite and the
   // project dir, so an explicit grant may override it (e.g. running on a project
   // that lives under ~/Documents). The hard secret deny below is what's binding.
   const softDeny = [
     ...config.denyHome.map((d) => subpath(path.join(HOME, d))),
-    ...config.paths.deny.map((p) => subpath(expandHome(p))),
+    ...paths.deny.map((p) => subpath(expandHome(p))),
   ];
+  // `file-read*` covers metadata, so this takes stat away too. The second rule
+  // extends a deny to unix sockets *under* those paths: that's a different
+  // operation class, and without it `paths.deny` on a dir would still leave a
+  // socket inside it connectable (how the 1Password agent stayed reachable). Both
+  // stay overridable by a later explicit grant, soft-tier as before.
   add(
     'soft privacy DENY list (overridable by explicit grants)',
-    deny('file-read* file-write*', ...softDeny),
+    [deny('file-read* file-write*', ...softDeny), deny('network-outbound', ...softDeny)].join('\n'),
   );
 
-  add(
-    'SSH: bot key + known_hosts (personal keys hard-denied at the very end)',
-    [
-      allow(
-        'file-read*',
-        literal(path.join(HOME, '.ssh')),
-        literal(path.join(HOME, '.ssh/known_hosts')),
-        literal(path.join(HOME, '.ssh/known_hosts2')),
-        literal(path.join(HOME, '.ssh/config')),
-        subpath(sshDir),
-      ),
-      allow(
-        'file-write*',
-        literal(path.join(HOME, '.ssh/known_hosts')),
-        literal(path.join(HOME, '.ssh/known_hosts2')),
-      ),
-    ].join('\n'),
-  );
+  baseGroup('SSH: known_hosts + config (personal keys hard-denied at the very end)');
+  // The bot key dir is config-driven (`config.bot.sshDir`), so it can't live in
+  // the static table.
+  add('SSH: bot key dir', grants({ [sshDir]: 'r' }));
 
-  // Extra user-supplied RO / RW / exec rules. Hook scripts that claude must run
-  // inside the sandbox are granted via `paths.exec` (read via `paths.readOnly`).
-  // Compiled hooks (config.hooks) only register the script with claude — the
-  // sandbox still needs an exec grant for the script's path to actually run.
-  if (config.paths.readOnly.length)
-    add(
-      'extra read-only paths',
-      allow('file-read*', ...config.paths.readOnly.map((p) => subpath(expandHome(p)))),
-    );
-  if (config.paths.readWrite.length)
-    add(
-      'extra read-write paths',
-      allow('file-read* file-write*', ...config.paths.readWrite.map((p) => subpath(expandHome(p)))),
-    );
-  if (config.paths.exec.length)
-    add(
-      'extra exec paths',
-      allow('process-exec', ...config.paths.exec.map((p) => subpath(expandHome(p)))),
-    );
+  // The box's own grants — one table, compiled by the same `grantBlock` as the
+  // base policy (see ResolvedPathRules.table). Emitted AFTER the soft privacy
+  // deny, so an explicit grant can override it (a project under ~/Documents, a
+  // whole-disk `'/': 'w'` box), and BEFORE the hard secret deny, so nothing here
+  // can uncover credentials. `paths.deny` went into the soft tier above.
+  //
+  // Hook scripts that claude must run inside the sandbox need `'re'`: compiled
+  // hooks (config.hooks) only register the script with claude, the sandbox still
+  // has to allow exec'ing its path.
+  if (Object.keys(paths.table).length) add('box grants (config.paths)', grants(paths.table));
 
   add(
     'project workspace (RW)',
     [
-      allow('file-read* file-write* file-map-executable', subpath(projectDir)),
-      allow('process-exec', subpath(projectDir)),
+      allow('file-read* file-write* file-map-executable', sp(projectDir)),
+      allow('process-exec', sp(projectDir)),
     ].join('\n'),
   );
 
@@ -441,14 +578,37 @@ export function buildProfile(
   // `!`-prefixed patterns re-allow — last-match-wins mirrors `.gitignore`, so
   // the order in `denyGlobs` is load-bearing. Patterns are data (config); this
   // is just the compiler.
-  if (config.paths.denyGlobs.length) {
-    const projRe = reEscape(projectDir);
-    const rules = config.paths.denyGlobs.map((g) => {
+  const projRe = reEscape(projectDir);
+  /** `<project>/**​/<glob>` as an SBPL regex — the shared shape of both glob tiers. */
+  const projectGlob = (g: string): string => regex(`^${projRe}/(.*/)?${globToRegexBody(g)}(/|$)`);
+  if (paths.denyGlobs.length) {
+    const rules = paths.denyGlobs.map((g) => {
       const neg = g.startsWith('!');
-      const re = regex(`^${projRe}/(.*/)?${globToRegexBody(neg ? g.slice(1) : g)}(/|$)`);
+      const re = projectGlob(neg ? g.slice(1) : g);
       return neg ? allow('file-read*', re) : deny('file-read*', re);
     });
     add('glob read-deny in project (gitignore-style — `.env`, dunder, …)', rules.join('\n'));
+  }
+
+  // Glob write-DENY, same compiler and placement, but it takes `file-write*`
+  // only — the box keeps reading these files, it just can't change them.
+  //
+  // This closes the class of escape where the box writes a file that something
+  // *outside* the sandbox executes later: clabox's own `clabox.config.*` (read
+  // by the next launch, before any profile exists), `.git/config` (`core.pager`
+  // / `fsmonitor` / `hooksPath` run on the user's next git command, in their own
+  // shell), `.git/hooks`, and `.envrc` (direnv runs it on `cd`). The default
+  // list is DEFAULT_DENY_WRITE_GLOBS in config.ts; a box can replace it.
+  if (paths.denyWriteGlobs.length) {
+    const rules = paths.denyWriteGlobs.map((g) => {
+      const neg = g.startsWith('!');
+      const re = projectGlob(neg ? g.slice(1) : g);
+      return neg ? allow('file-write*', re) : deny('file-write*', re);
+    });
+    add(
+      'glob write-deny in project (files executed OUTSIDE the box: clabox.config.*, .git/config, hooks, .envrc)',
+      rules.join('\n'),
+    );
   }
 
   // Hard secret DENY — emitted LAST of all file rules so it wins even over a
@@ -497,16 +657,101 @@ export function buildProfile(
   add(
     'clabox home (box configs + compiled mcp/settings) READ-ONLY — re-granted after the hard deny',
     [
-      allow('file-read*', ...claboxDirs.map(subpath)),
+      allow('file-read*', ...claboxDirs.map(sp)),
       // …plus exec, so a box's hook scripts can live in ~/.config/clabox (e.g.
       // a notify.sh) and actually run in-box without a separate `paths.exec`.
-      allow('process-exec', ...claboxDirs.map(subpath)),
+      allow('process-exec', ...claboxDirs.map(sp)),
     ].join('\n'),
   );
 
-  if (config.network) add('networking', '(allow network*)');
+  // stat(2) on the ANCESTORS of everything granted above — the last file rule in
+  // the profile, so it survives the hard deny (and must, because the hard deny
+  // covers `~/.config` while the carve-out right above it grants
+  // `~/.config/clabox`: without metadata on the intervening `~/.config`, a lookup
+  // of the box's own `--mcp-config` can fail on the way down).
+  //
+  // This is the one place `stat` is granted implicitly rather than as part of a
+  // read/write grant, and it is deliberately narrow: `literal` per directory, so
+  // only the directories the profile already names become stat-able — never their
+  // children. `~/.ssh` is stat-able, `~/.ssh/id_ed25519` is not; `~/Library` is,
+  // `~/Library/Group Containers/<team>.<app>` is not. Paths that already carry a
+  // read grant are skipped — `file-read*` includes `file-read-metadata`.
+  const statDirs = [...new Set([...statRoots, ...[...granted].flatMap(pathAncestors)])]
+    .filter((p) => !granted.has(p))
+    .sort();
+  if (statDirs.length)
+    add(
+      'stat(2) on granted paths ancestors (metadata only — the last file rule)',
+      allow('file-read-metadata', ...statDirs.map(literal)),
+    );
 
-  sections.push('(allow process-fork)\n(allow lsopen)');
+  // Networking, split by ADDRESS FAMILY — the profile used to emit a bare
+  // `(allow network*)`, and that single line was wider than "the box may use the
+  // internet". In Seatbelt a unix-socket `connect(2)` is authorized as
+  // `network-outbound` with a *path* filter, so an unfiltered grant handed the box
+  // every unix socket on the machine: 1Password's `t/agent.sock` (ask the agent to
+  // sign → authenticate as the user), `/var/run/docker.sock` (root on the host,
+  // outside every box), gpg-agent, `op`. None of it is reachable through a file
+  // rule, so every deny tier in this profile missed it — a box could be denied
+  // read, write AND stat on the 1Password container and still run `ssh-add -l`
+  // against the agent inside it.
+  //
+  // IP keeps the old behaviour. Unix sockets are now opt-in per path
+  // (`paths.socket`, or the `'c'` right), with one default below.
+  if (config.network) {
+    add(
+      'networking — IP only (unix sockets are opt-in: paths.socket / `c`)',
+      [
+        allow('network-outbound', '(remote ip)'),
+        allow('network-inbound', '(local ip)'),
+        allow('network-bind', '(local ip)'),
+      ].join('\n'),
+    );
+  }
+
+  // The unix sockets a box may connect to. Emitted regardless of
+  // `config.network`: a socket is local IPC, not internet access, so an offline
+  // box can still be given `docker.sock`.
+  // The resolver socket is base-policy data, emitted from the table like the rest.
+  baseGroup('unix sockets (default allowlist)');
+
+  // claude's daemon dir (`/tmp/cc-daemon-<uid>/<hash>/control.sock` plus the
+  // `--bg-pty-host` sockets beside it) is the channel to the singleton
+  // `claude daemon` — which runs OUTSIDE every box and can re-host this session
+  // with `--fork-session --resume` and no profile. The env guard
+  // (SANDBOX_ESCAPE_GUARDS) is what actually closes that escape, but it is
+  // *cooperative*: a var inside a process the agent controls. So the socket now
+  // follows the feature that needs it — `--rc` / `config.remoteControl`, or a
+  // box that opted into background tasks — instead of being granted to every
+  // box including the ones that never speak to a daemon.
+  const wantsDaemon = config.remoteControl || config.allowBackgroundTasks;
+  // The opener broker's socket (`clabox opener`, which runs outside the box).
+  // Granted to every box unless it opts out with `opener: { enabled: false }`.
+  // This is the brokered alternative to `allowOpen` and grants far less: the box
+  // can ask for a Finder reveal or an editor open, and cannot choose what gets
+  // executed (see src/opener/protocol.ts). The socket also only exists while a
+  // broker is running, so the grant on its own opens nothing.
+  const opener = resolvedOpener(config);
+  const socketPaths = [
+    ...(wantsDaemon ? [`/private/tmp/cc-daemon-${process.getuid?.() ?? ''}`] : []),
+    ...(opener ? [openerSocketPath()] : []),
+    ...paths.socket.map(expandHome),
+  ];
+  // Each path is emitted as BOTH matchers, because a socket grant is sometimes a
+  // single socket file (`.../mDNSResponder`, `docker.sock`) and sometimes the dir
+  // holding them (claude's daemon dir, whose socket names carry a hash). Apple's
+  // profiles use `literal` for the former and `subpath` for the latter; emitting
+  // both means a box config doesn't have to know which kind it named.
+  if (socketPaths.length) {
+    add(
+      'unix-socket connect (opt-in per path)',
+      allow('network-outbound', ...socketPaths.flatMap((p) => [lit(p), sp(p)])),
+    );
+  }
+
+  // `process-fork` and nothing else: `lsopen` used to live here, and it is now
+  // emitted only for `config.allowOpen` (see the Launch Services section).
+  sections.push('(allow process-fork)');
 
   const text = `${sections.join('\n\n')}\n`;
 
