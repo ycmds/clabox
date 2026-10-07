@@ -37,7 +37,7 @@ import {
 
 const PROJECT = '/tmp/sample-project';
 const build = (over: Record<string, unknown> = {}) =>
-  buildProfile(mergeConfig(defaultConfig, over), { projectDir: PROJECT, detectedPaths: [] });
+  buildProfile(mergeConfig(defaultConfig, over), { projectDir: PROJECT });
 
 /** A canonical (symlink-resolved) tmp dir — macOS `os.tmpdir()` is under /var. */
 const realTmp = (prefix: string): string =>
@@ -247,7 +247,6 @@ describe('stat (file-read-metadata) scoping', () => {
     // do are skipped — `file-read*` includes `file-read-metadata`.)
     const deep = buildProfile(defaultConfig, {
       projectDir: path.join(os.homedir(), 'work/repos/app'),
-      detectedPaths: [],
     });
     const deepStart = deep.indexOf('stat(2) on granted paths ancestors');
     const deepTail = deep.slice(deepStart, deep.indexOf(';; ----------', deepStart + 1));
@@ -567,6 +566,46 @@ describe('base-policy paths are resolved-form (the /private pairing)', () => {
     const p = build();
     expect(p).toContain('(subpath "/private/var/select")');
     expect(p).toContain('(literal "/private/var/db/xcode_select_link")');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unit: `~/.local` is granted per toolchain, never as one tree
+//
+// The regression: `detectPackagePaths()` probed the filesystem and, finding
+// `~/.local` (every machine has one — claude installs itself there), emitted
+// `(allow file-read* file-map-executable process-exec (subpath "~/.local"))`.
+// XDG keeps *application data* under `~/.local/share`, so that single rule gave
+// every box read access to things no config ever mentioned — app databases,
+// notes, chat history — and it did so invisibly: the box config said nothing and
+// the profile named only `~/.local`.
+// ---------------------------------------------------------------------------
+
+describe('~/.local is granted per toolchain, not as a tree', () => {
+  const local = path.join(os.homedir(), '.local');
+
+  test('the whole-tree grant is gone', () => {
+    const p = build();
+    expect(p).not.toContain(`(subpath "${local}")`);
+    expect(p).not.toContain(`(subpath "${path.join(local, 'share')}")`);
+  });
+
+  test('the named toolchain roots are granted', () => {
+    const p = build();
+    // `~/.local/bin` holds only symlinks into `~/.local/share/<tool>/…` and
+    // Seatbelt matches the resolved path, so each target root needs its own
+    // entry. `share/claude` is the load-bearing one: that is where the native
+    // installer puts the binary clabox execs.
+    for (const dir of ['bin', 'lib', 'share/claude', 'share/mise', 'share/uv']) {
+      expect(p).toContain(`(subpath "${path.join(local, dir)}")`);
+    }
+  });
+
+  test('a box can grant one more app dir without reopening the tree', () => {
+    const extra = path.join(local, 'share/some-app');
+    const p = build({ paths: { [extra]: 'r' } });
+    expect(p).toContain(`(subpath "${extra}")`);
+    expect(p).not.toContain(`(subpath "${local}")`);
   });
 });
 
@@ -1001,7 +1040,7 @@ describe('withExtraPaths (CLI --ro/--rw)', () => {
       readOnly: ['/tmp/cli-ro'],
       readWrite: ['/tmp/cli-rw'],
     });
-    const p = buildProfile(cfg, { projectDir: PROJECT, detectedPaths: [] });
+    const p = buildProfile(cfg, { projectDir: PROJECT });
     expect(p).toContain('(subpath "/tmp/cli-ro")');
     expect(p).toContain('(subpath "/tmp/cli-rw")');
   });
@@ -1030,7 +1069,7 @@ describe('resolveProjectDir', () => {
 
   test('config.cwd becomes the read-write project dir in the profile', () => {
     const cfg = mergeConfig(defaultConfig, { cwd: '/tmp/box-project' });
-    const p = buildProfile(cfg, { projectDir: resolveProjectDir(cfg), detectedPaths: [] });
+    const p = buildProfile(cfg, { projectDir: resolveProjectDir(cfg) });
     expect(p).toContain('(subpath "/tmp/box-project")');
   });
 });
@@ -1117,7 +1156,7 @@ describe('sandbox enforcement (real sandbox-exec)', () => {
       paths: { readWrite: [], readOnly: [], exec: [], deny: [secretDir] },
     });
     const profileFile = path.join(root, 'profile.sb');
-    fs.writeFileSync(profileFile, buildProfile(cfg, { projectDir, detectedPaths: [] }));
+    fs.writeFileSync(profileFile, buildProfile(cfg, { projectDir }));
 
     const run = (bin: string, ...a: string[]) =>
       spawnSync('sandbox-exec', ['-f', profileFile, bin, ...a], { encoding: 'utf8' });
@@ -1159,7 +1198,7 @@ describe('sandbox enforcement (real sandbox-exec)', () => {
         network: false,
         paths: { denyGlobs: ['**/.env*', '!**/.env.example', '**/___*'] },
       });
-      fs.writeFileSync(profileFile, buildProfile(cfg, { projectDir, detectedPaths: [] }));
+      fs.writeFileSync(profileFile, buildProfile(cfg, { projectDir }));
       const cat = (p: string) =>
         spawnSync('sandbox-exec', ['-f', profileFile, '/bin/cat', p], { encoding: 'utf8' }).status;
 
@@ -1197,7 +1236,6 @@ describe('sandbox enforcement (real sandbox-exec)', () => {
       file,
       buildProfile(mergeConfig(defaultConfig, { network: false }), {
         projectDir,
-        detectedPaths: [],
       }),
     );
     const stat = (p: string) =>
@@ -1234,7 +1272,7 @@ describe('sandbox enforcement (real sandbox-exec)', () => {
       paths: { deny: [peek], stat: [peek] },
     });
     const file = path.join(root, 'profile.sb');
-    fs.writeFileSync(file, buildProfile(cfg, { projectDir, detectedPaths: [] }));
+    fs.writeFileSync(file, buildProfile(cfg, { projectDir }));
     const run = (bin: string, ...a: string[]) =>
       spawnSync('sandbox-exec', ['-f', file, bin, ...a], { encoding: 'utf8' });
 
@@ -1254,7 +1292,7 @@ describe('sandbox enforcement (real sandbox-exec)', () => {
   test.skipIf(skipSandbox)('mkdtemp inside $TMPDIR still works without global stat', () => {
     const root = realTmp('cb-tmpdir-');
     const file = path.join(root, 'profile.sb');
-    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root, detectedPaths: [] }));
+    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root }));
     const r = spawnSync(
       'sandbox-exec',
       [
@@ -1318,7 +1356,7 @@ except Exception as e:
     // /tmp is granted read-write, so the socket FILE is fully accessible — the
     // only thing standing between the box and the agent is the network rule.
     const closed = path.join(root, 'closed.sb');
-    fs.writeFileSync(closed, buildProfile(defaultConfig, { projectDir, detectedPaths: [] }));
+    fs.writeFileSync(closed, buildProfile(defaultConfig, { projectDir }));
     expect(connect(closed)).toContain('DENIED');
 
     const opened = path.join(root, 'opened.sb');
@@ -1326,7 +1364,6 @@ except Exception as e:
       opened,
       buildProfile(mergeConfig(defaultConfig, { paths: { [sockPath]: 'c' } }), {
         projectDir,
-        detectedPaths: [],
       }),
     );
     expect(connect(opened)).toContain('CONNECTED');
@@ -1338,7 +1375,7 @@ except Exception as e:
   test.skipIf(skipSandbox)('TCP to a local listener still works', () => {
     const root = realTmp('cb-tcp-');
     const file = path.join(root, 'profile.sb');
-    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root, detectedPaths: [] }));
+    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root }));
 
     const srv = spawn('/usr/bin/python3', [
       '-c',
@@ -1388,7 +1425,7 @@ except Exception as e:
     // `print` proves the entropy read at startup succeeds inside the sandbox.
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cb-py-')));
     const file = path.join(root, 'profile.sb');
-    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root, detectedPaths: [] }));
+    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root }));
     const r = spawnSync('sandbox-exec', ['-f', file, '/usr/bin/python3', '-c', 'print("ok")'], {
       encoding: 'utf8',
     });
@@ -1411,7 +1448,7 @@ except Exception as e:
   test.skipIf(skipSandbox)('the CA bundle is readable through the /etc symlink', () => {
     const root = realTmp('cb-etc-');
     const file = path.join(root, 'profile.sb');
-    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root, detectedPaths: [] }));
+    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root }));
     const read = (p: string) =>
       spawnSync('sandbox-exec', ['-f', file, '/bin/cat', p], { encoding: 'utf8' });
 
@@ -1434,7 +1471,7 @@ except Exception as e:
   test.skipIf(skipSandbox)('a toolchain shim can read the xcode-select link', () => {
     const root = realTmp('cb-git-');
     const file = path.join(root, 'profile.sb');
-    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root, detectedPaths: [] }));
+    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root }));
     const r = spawnSync('sandbox-exec', ['-f', file, '/usr/bin/git', '--version'], {
       encoding: 'utf8',
     });
@@ -1453,7 +1490,7 @@ except Exception as e:
     const root = realTmp('cb-sig-');
     const file = path.join(root, 'profile.sb');
     const pidFile = path.join(root, 'pid');
-    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root, detectedPaths: [] }));
+    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root }));
 
     // The sleep is started by an inner shell that then exits, so by the time it
     // is signalled it is NOT a child of the signalling process any more (it is
@@ -1489,7 +1526,7 @@ except Exception as e:
   test.skipIf(skipSandbox)('a box can NOT signal a process outside the sandbox', () => {
     const root = realTmp('cb-sig-out-');
     const file = path.join(root, 'profile.sb');
-    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root, detectedPaths: [] }));
+    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: root }));
 
     // Same uid, same user, started outside any sandbox: nothing but the profile
     // stands between the box and this process.
@@ -1532,7 +1569,6 @@ except Exception as e:
       file,
       buildProfile(mergeConfig(defaultConfig, { network: false }), {
         projectDir,
-        detectedPaths: [],
       }),
     );
     const sh = (script: string) =>
@@ -1584,7 +1620,7 @@ except Exception as e:
     });
 
     const file = path.join(root, 'profile.sb');
-    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir, detectedPaths: [] }));
+    fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir }));
     const r = spawnSync(
       'sandbox-exec',
       ['-f', file, '/usr/bin/open', '-W', path.join(root, 'Esc.app')],

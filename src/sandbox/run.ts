@@ -15,7 +15,7 @@ import {
 } from '../utils/config.js';
 import { boxSlug, buildBoxExtras, type ExtraFile } from './extras.js';
 import { ensureProcTools } from './proctools.js';
-import { buildProfile, detectPackagePaths } from './profile.js';
+import { buildProfile } from './profile.js';
 import { buildTabDecor } from './tab.js';
 import { sttyIo, suppressEcho } from './tty.js';
 
@@ -81,7 +81,7 @@ export function buildProfileText(
   config: Config,
   projectDir: string = resolveProjectDir(config),
 ): string {
-  return buildProfile(config, { projectDir, detectedPaths: detectPackagePaths() });
+  return buildProfile(config, { projectDir });
 }
 
 /**

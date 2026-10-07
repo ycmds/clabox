@@ -10,10 +10,9 @@
 // only, not the tree below it. A key starting with `^` is an SBPL regex.
 //
 // What is deliberately NOT here, because it cannot be written as a static
-// value: the package managers found at runtime (`profile.ts#detectPackagePaths`),
-// the Xcode toolchain behind `xcode-select` (`#resolvedDeveloperDirs`), the
-// Claude config dir, the bot ssh dir, the project workspace, clabox's own home,
-// and the non-path grants (mach services, `sysctl-read`, `signal`,
+// value: the Xcode toolchain behind `xcode-select` (`#resolvedDeveloperDirs`),
+// the Claude config dir, the bot ssh dir, the project workspace, clabox's own
+// home, and the non-path grants (mach services, `sysctl-read`, `signal`,
 // `process-info*`) — those are still built in `profile.ts`.
 
 /**
@@ -71,9 +70,8 @@ export const PRIVATE_SYMLINK_ROOTS = ['/etc', '/tmp', '/var'];
  * map-executable, `e` exec, `i` ioctl, `c` unix-socket connect, `d` deny, and the
  * matcher modifier `l` = this path only (not the tree below it).
  *
- * What is NOT here, because it can't be expressed as a static path: the package
- * managers found at runtime (`detectPackagePaths`), the Xcode toolchain behind
- * `xcode-select` (`resolvedDeveloperDirs`), the Claude config dir
+ * What is NOT here, because it can't be expressed as a static path: the Xcode
+ * toolchain behind `xcode-select` (`resolvedDeveloperDirs`), the Claude config dir
  * (`config.configDir`), the bot ssh dir (`config.bot.sshDir`), the project
  * workspace, clabox's own home, and the non-path grants (mach services,
  * `sysctl-read`, `signal`, `process-info*`).
@@ -142,6 +140,43 @@ export const BASE_PATH_GROUPS: BasePathGroup[] = [
       '/private/var/db/xcode_select_link': 'rl',
       '/var/db/xcode_select_link': 'rl',
       '/usr/bin/env': 'el', // shebang target; `l` because /usr is already exec'able
+    },
+  },
+  {
+    title: 'package managers & user-installed toolchains',
+    // Data, not autodetection. This used to be `detectPackagePaths()`, which
+    // probed the filesystem and — on finding `~/.local` (every machine has one;
+    // claude installs itself there) — granted the **whole tree** `rme`. XDG puts
+    // tools in `~/.local/bin`+`lib` but *application data* in `~/.local/share`,
+    // so that one `existsSync` quietly handed every box read access to things
+    // like `~/.local/share/<app>/<app>.db`. Nothing in a box config said so and
+    // nothing in the profile named it: the rule read `(subpath "~/.local")`.
+    //
+    // Now each toolchain root is listed by name and a box can add or remove one
+    // like any other path. A rule for a path that doesn't exist matches nothing,
+    // so listing all the usual locations costs nothing on a host missing them —
+    // which is why the probing could go away entirely.
+    paths: {
+      '/opt/homebrew': 'rme', // Homebrew on Apple Silicon
+      '/usr/local/Homebrew': 'rme', // …and on Intel
+      '/nix/store': 'rme', // Nix
+      // `~/.local/bin` is only ever symlinks — `claude`, `uv` tools, `cursor-agent`
+      // all point into `~/.local/share/<tool>/…` — and Seatbelt matches the
+      // RESOLVED path, so granting `bin` alone authorizes nothing at all. Each
+      // target root therefore needs its own entry; `~/.local/share/claude` is the
+      // load-bearing one, since that is where the native installer puts the
+      // `claude` binary this whole tool execs.
+      '~/.local/bin': 'rme',
+      '~/.local/lib': 'rme',
+      '~/.local/share/claude': 'rme', // the claude CLI itself (native installer)
+      '~/.local/share/mise': 'rme', // mise-managed runtimes + shims
+      '~/.local/share/uv': 'rme', // uv: `uv tool` installs + managed pythons
+      '~/.local/share/pipx': 'rme', // pipx venvs
+      '~/.local/share/pnpm': 'rme', // pnpm global store
+      '~/.local/share/rustup': 'rme', // rustup toolchains (XDG layout)
+      // NOT granted on purpose: everything else under `~/.local/share`, which is
+      // application data (notes, databases, caches, chat history). A box that
+      // needs one names it — `'~/.local/share/<tool>': 'rme'`.
     },
   },
   {

@@ -104,7 +104,6 @@ export {
 } from './sandbox/proctools.js';
 export {
   buildProfile,
-  detectPackagePaths,
   globalName,
   ipcName,
   literal,

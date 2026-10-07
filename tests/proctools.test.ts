@@ -129,7 +129,7 @@ describe('ensureProcTools', () => {
       const file = path.join(home, 'profile.sb');
       // Built under the same CLABOX_CONFIGS_DIR, so the profile's clabox-home
       // carve-out (read + process-exec) covers <home>/bin.
-      fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: home, detectedPaths: [] }));
+      fs.writeFileSync(file, buildProfile(defaultConfig, { projectDir: home }));
       return { psPath: results.find((r) => r.name === 'ps')?.path as string, profileFile: file };
     });
 

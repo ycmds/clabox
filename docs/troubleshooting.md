@@ -759,6 +759,78 @@ is the network rule), then connects to it from inside a box twice: denied with t
 default profile, connected once the path carries `'c'`. Plus a TCP test against a
 local listener, so the IP half is kept honest.
 
+## A box could read `~/.local/share/<app>` and no config said so
+
+**Symptom.** You ask a box to check its own reach and it reports access to
+something nobody granted it:
+
+```
+~/.local/share/<app>/<app>.db   331 MB, -rw-r--r--   reads fine
+sqlite3 … 'SELECT COUNT(*)'     117 742 rows         works
+ls ~/.local/share/<app>/                             lists
+```
+
+Nothing in the box config mentions that path. Grepping the generated profile for
+the app's name finds nothing either — which is what makes it hard to attribute.
+
+**Cause.** `profile.ts#detectPackagePaths()`, now removed. It probed the
+filesystem for package managers and granted each hit as a whole tree:
+
+```ts
+const local = path.join(HOME, '.local');
+if (fs.existsSync(local)) paths.push(local);   // → (subpath "~/.local"), rights `rme`
+```
+
+`~/.local` exists on every machine (claude's native installer lives there), so
+the probe always fired. XDG splits that directory — `bin`/`lib` are tools,
+`share`/`state` are **application data** — and the grant made no such
+distinction. In the profile it appears only as the parent:
+
+```
+;; ---------- package managers + Xcode / Command Line Tools (autodetected)
+(allow file-read* file-map-executable process-exec
+  (subpath "/Users/<you>/.local")      ← everything under here
+```
+
+No write (`rme` carries no `file-write*`), so the data could be read, enumerated
+and copied, not modified.
+
+**Fix.** The probing is gone; the locations are base-policy data in
+`policy/base.ts` ("package managers & user-installed toolchains"). A rule for an
+absent path matches nothing, so listing every usual location costs nothing and
+the `existsSync` bought nothing. `~/.local` is now granted per toolchain root:
+`bin`, `lib`, and `share/{claude,mise,uv,pipx,pnpm,rustup}`.
+
+**The part to not get wrong when editing that list:** `~/.local/bin` holds only
+symlinks, and Seatbelt matches the **resolved** path — so granting `bin` alone
+authorizes nothing:
+
+```
+$ ls -l ~/.local/bin/claude
+… claude -> /Users/<you>/.local/share/claude/versions/2.1.289
+```
+
+Each target root needs its own entry, and `~/.local/share/claude` is load-bearing:
+without it the box cannot exec the very binary clabox launches. Same shape for
+`uv` tools (`~/.local/share/uv/tools/<x>/bin/<x>`) and `cursor-agent`.
+
+**Adding one back** — a tool that lives under `~/.local/share` and isn't in the
+default list:
+
+```js
+paths: { '~/.local/share/cursor-agent': 'rme' }
+```
+
+and the inverse, which was impossible while the parent was granted wholesale:
+
+```js
+paths: { '~/.local/share/<app>': 'd' }
+```
+
+Pinned by `tests/profile.test.ts` → *"~/.local is granted per toolchain, not as a
+tree"*, which asserts `(subpath "<HOME>/.local")` is absent from the default
+profile.
+
 ## No `git`, no `python3`, and `curl` claims the box has no network
 
 Three separate EPERMs that each present as a broken *tool* rather than as a

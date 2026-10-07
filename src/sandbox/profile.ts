@@ -217,19 +217,6 @@ export function sameRights(list: string[], rights: string): GrantTable {
   return Object.fromEntries(list.map((p) => [p, rights]));
 }
 
-// ---- package-manager autodetection ----------------------------------------
-
-/** Detect installed package managers whose paths must be readable/executable. */
-export function detectPackagePaths(): string[] {
-  const paths: string[] = [];
-  if (fs.existsSync('/opt/homebrew')) paths.push('/opt/homebrew');
-  else if (fs.existsSync('/usr/local/Homebrew')) paths.push('/usr/local/Homebrew');
-  const local = path.join(HOME, '.local');
-  if (fs.existsSync(local)) paths.push(local);
-  if (fs.existsSync('/nix/store')) paths.push('/nix/store');
-  return paths;
-}
-
 /**
  * The clabox home as it physically resolves on disk, but ONLY when
  * {@link claboxHomeDir} is a symlink (so the real path differs from the nominal
@@ -301,18 +288,14 @@ export function resolvedDeveloperDirs(): string[] {
 /** Context needed to assemble a profile for a specific project. */
 export interface ProfileContext {
   projectDir: string;
-  detectedPaths?: string[];
 }
 
 /**
  * Build the full SBPL profile text.
  * @param config  effective config (see config.ts)
- * @param ctx     { projectDir, detectedPaths }
+ * @param ctx     { projectDir }
  */
-export function buildProfile(
-  config: Config,
-  { projectDir, detectedPaths = detectPackagePaths() }: ProfileContext,
-): string {
+export function buildProfile(config: Config, { projectDir }: ProfileContext): string {
   const configDir = expandHome(config.configDir);
   const sshDir = expandHome(config.bot.sshDir);
   const homeRe = reEscape(HOME);
@@ -411,15 +394,12 @@ export function buildProfile(
 
   baseGroup('basic dir traversal');
   baseGroup('system runtime + exec (read-only)');
+  baseGroup('package managers & user-installed toolchains');
 
-  // Not expressible as static data — these are resolved at run time:
-  //   detectPackagePaths() finds Homebrew / ~/.local / nix,
-  //   resolvedDeveloperDirs() follows `xcode-select` through its symlink.
+  // The one toolchain grant that can't be static data: `resolvedDeveloperDirs()`
+  // follows `xcode-select` through its symlink to whatever bundle is selected.
   const developerDirs = [...STATIC_DEVELOPER_DIRS, ...resolvedDeveloperDirs()];
-  add(
-    'package managers + Xcode / Command Line Tools (autodetected)',
-    grants({ ...sameRights(detectedPaths, 'rme'), ...sameRights(developerDirs, 'rme') }),
-  );
+  add('Xcode / Command Line Tools (xcode-select)', grants(sameRights(developerDirs, 'rme')));
 
   baseGroup('temp dirs (RW)');
   // The $TMPDIR rule is a regex, which carries no plain path for the stat-ancestors
