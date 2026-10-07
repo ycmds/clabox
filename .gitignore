@@ -12,3 +12,5 @@ configs
 configs2
 # internal working notes — not published, not tracked
 docs/internal/
+# one-off patch scripts (.op7.mjs …) — scratch, deleted once applied
+.op*.mjs
